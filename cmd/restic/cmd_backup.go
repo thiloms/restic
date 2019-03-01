@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/textfile"
 	"github.com/restic/restic/internal/ui"
+	"github.com/restic/restic/internal/ui/jsonstatus"
 	"github.com/restic/restic/internal/ui/termstatus"
 )
 
@@ -68,20 +70,21 @@ given as the arguments.
 
 // BackupOptions bundles all options for the backup command.
 type BackupOptions struct {
-	Parent           string
-	Force            bool
-	Excludes         []string
-	ExcludeFiles     []string
-	ExcludeOtherFS   bool
-	ExcludeIfPresent []string
-	ExcludeCaches    bool
-	Stdin            bool
-	StdinFilename    string
-	Tags             []string
-	Host             string
-	FilesFrom        []string
-	TimeStamp        string
-	WithAtime        bool
+	Parent              string
+	Force               bool
+	Excludes            []string
+	InsensitiveExcludes []string
+	ExcludeFiles        []string
+	ExcludeOtherFS      bool
+	ExcludeIfPresent    []string
+	ExcludeCaches       bool
+	Stdin               bool
+	StdinFilename       string
+	Tags                []string
+	Host                string
+	FilesFrom           []string
+	TimeStamp           string
+	WithAtime           bool
 }
 
 var backupOptions BackupOptions
@@ -93,6 +96,7 @@ func init() {
 	f.StringVar(&backupOptions.Parent, "parent", "", "use this parent snapshot (default: last snapshot in the repo that has the same target files/directories)")
 	f.BoolVarP(&backupOptions.Force, "force", "f", false, `force re-reading the target files/directories (overrides the "parent" flag)`)
 	f.StringArrayVarP(&backupOptions.Excludes, "exclude", "e", nil, "exclude a `pattern` (can be specified multiple times)")
+	f.StringArrayVar(&backupOptions.InsensitiveExcludes, "iexclude", nil, "same as `--exclude` but ignores the casing of filenames")
 	f.StringArrayVar(&backupOptions.ExcludeFiles, "exclude-file", nil, "read exclude patterns from a `file` (can be specified multiple times)")
 	f.BoolVarP(&backupOptions.ExcludeOtherFS, "one-file-system", "x", false, "exclude other file systems")
 	f.StringArrayVar(&backupOptions.ExcludeIfPresent, "exclude-if-present", nil, "takes filename[:header], exclude contents of directories containing filename (except filename itself) if header of that file is as provided (can be specified multiple times)")
@@ -220,6 +224,10 @@ func collectRejectByNameFuncs(opts BackupOptions, repo *repository.Repository, t
 			return nil, err
 		}
 		opts.Excludes = append(opts.Excludes, excludes...)
+	}
+
+	if len(opts.InsensitiveExcludes) > 0 {
+		fs = append(fs, rejectByInsensitivePattern(opts.InsensitiveExcludes))
 	}
 
 	if len(opts.Excludes) > 0 {
@@ -395,15 +403,43 @@ func runBackup(opts BackupOptions, gopts GlobalOptions, term *termstatus.Termina
 
 	var t tomb.Tomb
 
-	if gopts.verbosity >= 2 {
+	if gopts.verbosity >= 2 && !gopts.JSON {
 		term.Print("open repository\n")
 	}
+
 	repo, err := OpenRepository(gopts)
 	if err != nil {
 		return err
 	}
 
-	p := ui.NewBackup(term, gopts.verbosity)
+	type ArchiveProgressReporter interface {
+		CompleteItem(item string, previous, current *restic.Node, s archiver.ItemStats, d time.Duration)
+		StartFile(filename string)
+		CompleteBlob(filename string, bytes uint64)
+		ScannerError(item string, fi os.FileInfo, err error) error
+		ReportTotal(item string, s archiver.ScanStats)
+		SetMinUpdatePause(d time.Duration)
+		Run(ctx context.Context) error
+		Error(item string, fi os.FileInfo, err error) error
+		Finish(snapshotID restic.ID)
+
+		// ui.StdioWrapper
+		Stdout() io.WriteCloser
+		Stderr() io.WriteCloser
+
+		// ui.Message
+		E(msg string, args ...interface{})
+		P(msg string, args ...interface{})
+		V(msg string, args ...interface{})
+		VV(msg string, args ...interface{})
+	}
+
+	var p ArchiveProgressReporter
+	if gopts.JSON {
+		p = jsonstatus.NewBackup(term, gopts.verbosity)
+	} else {
+		p = ui.NewBackup(term, gopts.verbosity)
+	}
 
 	// use the terminal for stdout/stderr
 	prevStdout, prevStderr := gopts.stdout, gopts.stderr
@@ -418,13 +454,15 @@ func runBackup(opts BackupOptions, gopts GlobalOptions, term *termstatus.Termina
 			if fps > 60 {
 				fps = 60
 			}
-			p.MinUpdatePause = time.Second / time.Duration(fps)
+			p.SetMinUpdatePause(time.Second / time.Duration(fps))
 		}
 	}
 
 	t.Go(func() error { return p.Run(t.Context(gopts.ctx)) })
 
-	p.V("lock repository")
+	if !gopts.JSON {
+		p.V("lock repository")
+	}
 	lock, err := lockRepo(repo)
 	defer unlockRepo(lock)
 	if err != nil {
@@ -443,7 +481,9 @@ func runBackup(opts BackupOptions, gopts GlobalOptions, term *termstatus.Termina
 		return err
 	}
 
-	p.V("load index files")
+	if !gopts.JSON {
+		p.V("load index files")
+	}
 	err = repo.LoadIndex(gopts.ctx)
 	if err != nil {
 		return err
@@ -454,7 +494,7 @@ func runBackup(opts BackupOptions, gopts GlobalOptions, term *termstatus.Termina
 		return err
 	}
 
-	if parentSnapshotID != nil {
+	if !gopts.JSON && parentSnapshotID != nil {
 		p.V("using parent snapshot %v\n", parentSnapshotID.Str())
 	}
 
@@ -478,7 +518,9 @@ func runBackup(opts BackupOptions, gopts GlobalOptions, term *termstatus.Termina
 
 	var targetFS fs.FS = fs.Local{}
 	if opts.Stdin {
-		p.V("read data from stdin")
+		if !gopts.JSON {
+			p.V("read data from stdin")
+		}
 		targetFS = &fs.Reader{
 			ModTime:    timeStamp,
 			Name:       opts.StdinFilename,
@@ -494,7 +536,9 @@ func runBackup(opts BackupOptions, gopts GlobalOptions, term *termstatus.Termina
 	sc.Error = p.ScannerError
 	sc.Result = p.ReportTotal
 
-	p.V("start scan on %v", targets)
+	if !gopts.JSON {
+		p.V("start scan on %v", targets)
+	}
 	t.Go(func() error { return sc.Scan(t.Context(gopts.ctx), targets) })
 
 	arch := archiver.New(repo, targetFS, archiver.Options{})
@@ -502,7 +546,7 @@ func runBackup(opts BackupOptions, gopts GlobalOptions, term *termstatus.Termina
 	arch.Select = selectFilter
 	arch.WithAtime = opts.WithAtime
 	arch.Error = p.Error
-	arch.CompleteItem = p.CompleteItemFn
+	arch.CompleteItem = p.CompleteItem
 	arch.StartFile = p.StartFile
 	arch.CompleteBlob = p.CompleteBlob
 
@@ -521,10 +565,14 @@ func runBackup(opts BackupOptions, gopts GlobalOptions, term *termstatus.Termina
 	uploader := archiver.IndexUploader{
 		Repository: repo,
 		Start: func() {
-			p.VV("uploading intermediate index")
+			if !gopts.JSON {
+				p.VV("uploading intermediate index")
+			}
 		},
 		Complete: func(id restic.ID) {
-			p.V("uploaded intermediate index %v", id.Str())
+			if !gopts.JSON {
+				p.V("uploaded intermediate index %v", id.Str())
+			}
 		},
 	}
 
@@ -532,14 +580,18 @@ func runBackup(opts BackupOptions, gopts GlobalOptions, term *termstatus.Termina
 		return uploader.Upload(gopts.ctx, t.Context(gopts.ctx), 30*time.Second)
 	})
 
-	p.V("start backup on %v", targets)
+	if !gopts.JSON {
+		p.V("start backup on %v", targets)
+	}
 	_, id, err := arch.Snapshot(gopts.ctx, targets, snapshotOpts)
 	if err != nil {
 		return errors.Fatalf("unable to save snapshot: %v", err)
 	}
 
-	p.Finish()
-	p.P("snapshot %s saved\n", id.Str())
+	p.Finish(id)
+	if !gopts.JSON {
+		p.P("snapshot %s saved\n", id.Str())
+	}
 
 	// cleanly shutdown all running goroutines
 	t.Kill(nil)

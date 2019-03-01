@@ -52,6 +52,10 @@ You can use the command ``restic ls latest`` or ``restic find foo`` to find the
 path to the file within the snapshot. This path you can then pass to
 `--include` in verbatim to only restore the single file or directory.
 
+There are case insensitive variants of of ``--exclude`` and ``--include`` called
+``--iexclude`` and ``--iinclude``. These options will behave the same way but
+ignore the casing of paths.
+
 Restore using mount
 ===================
 
@@ -65,7 +69,7 @@ command to serve the repository with FUSE:
     $ restic -r /srv/restic-repo mount /mnt/restic
     enter password for repository:
     Now serving /srv/restic-repo at /mnt/restic
-    Don't forget to umount after quitting!
+    When finished, quit with Ctrl-c or umount the mountpoint.
 
 Mounting repositories via FUSE is not possible on OpenBSD, Solaris/illumos
 and Windows. For Linux, the ``fuse`` kernel module needs to be loaded. For

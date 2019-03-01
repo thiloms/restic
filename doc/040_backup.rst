@@ -139,10 +139,10 @@ You can exclude folders and files by specifying exclude patterns, currently
 the exclude options are:
 
 -  ``--exclude`` Specified one or more times to exclude one or more items
+-  ``--iexclude`` Same as ``--exclude`` but ignores the case of paths
 -  ``--exclude-caches`` Specified once to exclude folders containing a special file
 -  ``--exclude-file`` Specified one or more times to exclude items listed in a given file
--  ``--exclude-if-present`` Specified one or more times to exclude a folders content
-   if it contains a given file (optionally having a given header)
+-  ``--exclude-if-present foo`` Specified one or more times to exclude a folder's content if it contains a file called ``foo``` (optionally having a given header, no wildcards for the file name supported)
 
  Let's say we have a file called ``excludes.txt`` with the following content:
 
@@ -289,6 +289,7 @@ this mode of operation, just supply the option ``--stdin`` to the
 
 .. code-block:: console
 
+    $ set -o pipefail
     $ mysqldump [...] | restic -r /srv/restic-repo backup --stdin
 
 This creates a new snapshot of the output of ``mysqldump``. You can then
@@ -301,6 +302,13 @@ specified with ``--stdin-filename``, e.g. like this:
 .. code-block:: console
 
     $ mysqldump [...] | restic -r /srv/restic-repo backup --stdin --stdin-filename production.sql
+
+The option ``pipefail`` is highly recommended so that a non-zero exit code from
+one of the programs in the pipe (e.g. ``mysqldump`` here) makes the whole chain
+return a non-zero exit code. Refer to the `Use the Unofficial Bash Strict Mode
+<http://redsymbol.net/articles/unofficial-bash-strict-mode/>`__ for more
+details on this.
+
 
 Tags for backup
 ***************
@@ -360,7 +368,7 @@ environment variables. The following list of environment variables:
 
     OS_USER_DOMAIN_NAME                 User domain name for keystone authentication
     OS_PROJECT_NAME                     Project name for keystone authentication
-    OS_PROJECT_DOMAIN_NAME              PRoject domain name for keystone authentication
+    OS_PROJECT_DOMAIN_NAME              Project domain name for keystone authentication
 
     OS_STORAGE_URL                      Storage URL for token authentication
     OS_AUTH_TOKEN                       Auth token for token authentication

@@ -302,7 +302,7 @@ Backblaze B2
 
 Restic can backup data to any Backblaze B2 bucket. You need to first setup the
 following environment variables with the credentials you can find in the
-dashboard in on the "Buckets" page when signed into your B2 account:
+dashboard on the "Buckets" page when signed into your B2 account:
 
 .. code-block:: console
 
@@ -520,7 +520,7 @@ interaction. If you use emulation environments like
 ``Mintty`` or ``rxvt``, you may get a password error.
 
 You can workaround this by using a special tool called ``winpty`` (look
-`here <https://sourceforge.net/p/msys2/wiki/Porting/>`__ and
+`here <https://github.com/msys2/msys2/wiki/Porting>`__ and
 `here <https://github.com/rprichard/winpty>`__ for detail information).
 On MSYS2, you can install ``winpty`` as follows:
 
