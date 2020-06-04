@@ -1,6 +1,7 @@
 package archiver
 
 import (
+	"bytes"
 	"context"
 	"io/ioutil"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/restic/restic/internal/checker"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/fs"
@@ -124,9 +126,9 @@ func saveFile(t testing.TB, repo restic.Repository, filename string, filesystem 
 
 func TestArchiverSaveFile(t *testing.T) {
 	var tests = []TestFile{
-		TestFile{Content: ""},
-		TestFile{Content: "foo"},
-		TestFile{Content: string(restictest.Random(23, 12*1024*1024+1287898))},
+		{Content: ""},
+		{Content: "foo"},
+		{Content: string(restictest.Random(23, 12*1024*1024+1287898))},
 	}
 
 	for _, testfile := range tests {
@@ -202,9 +204,9 @@ func TestArchiverSaveFileReaderFS(t *testing.T) {
 
 func TestArchiverSave(t *testing.T) {
 	var tests = []TestFile{
-		TestFile{Content: ""},
-		TestFile{Content: "foo"},
-		TestFile{Content: string(restictest.Random(23, 12*1024*1024+1287898))},
+		{Content: ""},
+		{Content: "foo"},
+		{Content: string(restictest.Random(23, 12*1024*1024+1287898))},
 	}
 
 	for _, testfile := range tests {
@@ -555,9 +557,12 @@ func TestFileChanged(t *testing.T) {
 	}
 
 	var tests = []struct {
-		Name    string
-		Content []byte
-		Modify  func(t testing.TB, filename string)
+		Name           string
+		SkipForWindows bool
+		Content        []byte
+		Modify         func(t testing.TB, filename string)
+		IgnoreInode    bool
+		SameFile       bool
 	}{
 		{
 			Name: "same-content-new-file",
@@ -572,6 +577,23 @@ func TestFileChanged(t *testing.T) {
 			Modify: func(t testing.TB, filename string) {
 				sleep()
 				save(t, filename, defaultContent)
+			},
+		},
+		{
+			Name: "new-content-same-timestamp",
+			// on Windows, there's no "create time" field users cannot modify,
+			// so we're unable to detect if a file has been modified when the
+			// timestamps are reset, so we skip this test for Windows
+			SkipForWindows: true,
+			Modify: func(t testing.TB, filename string) {
+				fi, err := os.Stat(filename)
+				if err != nil {
+					t.Fatal(err)
+				}
+				extFI := fs.ExtendedStat(fi)
+				save(t, filename, bytes.ToUpper(defaultContent))
+				sleep()
+				setTimestamp(t, filename, extFI.AccessTime, extFI.ModTime)
 			},
 		},
 		{
@@ -596,10 +618,26 @@ func TestFileChanged(t *testing.T) {
 				save(t, filename, defaultContent)
 			},
 		},
+		{
+			Name: "ignore-inode",
+			Modify: func(t testing.TB, filename string) {
+				fi := lstat(t, filename)
+				remove(t, filename)
+				sleep()
+				save(t, filename, defaultContent)
+				setTimestamp(t, filename, fi.ModTime(), fi.ModTime())
+			},
+			IgnoreInode: true,
+			SameFile:    true,
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.Name, func(t *testing.T) {
+			if runtime.GOOS == "windows" && test.SkipForWindows {
+				t.Skip("don't run test on Windows")
+			}
+
 			tempdir, cleanup := restictest.TempDir(t)
 			defer cleanup()
 
@@ -613,15 +651,24 @@ func TestFileChanged(t *testing.T) {
 			fiBefore := lstat(t, filename)
 			node := nodeFromFI(t, filename, fiBefore)
 
-			if fileChanged(fiBefore, node) {
+			if fileChanged(fiBefore, node, false) {
 				t.Fatalf("unchanged file detected as changed")
 			}
 
 			test.Modify(t, filename)
 
 			fiAfter := lstat(t, filename)
-			if !fileChanged(fiAfter, node) {
-				t.Fatalf("modified file detected as unchanged")
+
+			if test.SameFile {
+				// file should be detected as unchanged
+				if fileChanged(fiAfter, node, test.IgnoreInode) {
+					t.Fatalf("unmodified file detected as changed")
+				}
+			} else {
+				// file should be detected as changed
+				if !fileChanged(fiAfter, node, test.IgnoreInode) && !test.SameFile {
+					t.Fatalf("modified file detected as unchanged")
+				}
 			}
 		})
 	}
@@ -637,7 +684,7 @@ func TestFilChangedSpecialCases(t *testing.T) {
 
 	t.Run("nil-node", func(t *testing.T) {
 		fi := lstat(t, filename)
-		if !fileChanged(fi, nil) {
+		if !fileChanged(fi, nil, false) {
 			t.Fatal("nil node detected as unchanged")
 		}
 	})
@@ -646,7 +693,7 @@ func TestFilChangedSpecialCases(t *testing.T) {
 		fi := lstat(t, filename)
 		node := nodeFromFI(t, filename, fi)
 		node.Type = "symlink"
-		if !fileChanged(fi, node) {
+		if !fileChanged(fi, node, false) {
 			t.Fatal("node with changed type detected as unchanged")
 		}
 	})
@@ -1809,7 +1856,7 @@ func TestArchiverAbortEarlyOnError(t *testing.T) {
 	var tests = []struct {
 		src       TestDir
 		wantOpen  map[string]uint
-		failAfter uint // error after so many files have been saved to the repo
+		failAfter uint // error after so many blobs have been saved to the repo
 		err       error
 	}{
 		{
@@ -1829,26 +1876,29 @@ func TestArchiverAbortEarlyOnError(t *testing.T) {
 		{
 			src: TestDir{
 				"dir": TestDir{
-					"file1": TestFile{Content: string(restictest.Random(3, 4*1024*1024))},
-					"file2": TestFile{Content: string(restictest.Random(3, 4*1024*1024))},
-					"file3": TestFile{Content: string(restictest.Random(3, 4*1024*1024))},
-					"file4": TestFile{Content: string(restictest.Random(3, 4*1024*1024))},
-					"file5": TestFile{Content: string(restictest.Random(3, 4*1024*1024))},
-					"file6": TestFile{Content: string(restictest.Random(3, 4*1024*1024))},
-					"file7": TestFile{Content: string(restictest.Random(3, 4*1024*1024))},
-					"file8": TestFile{Content: string(restictest.Random(3, 4*1024*1024))},
-					"file9": TestFile{Content: string(restictest.Random(3, 4*1024*1024))},
+					"file1": TestFile{Content: string(restictest.Random(1, 1024))},
+					"file2": TestFile{Content: string(restictest.Random(2, 1024))},
+					"file3": TestFile{Content: string(restictest.Random(3, 1024))},
+					"file4": TestFile{Content: string(restictest.Random(4, 1024))},
+					"file5": TestFile{Content: string(restictest.Random(5, 1024))},
+					"file6": TestFile{Content: string(restictest.Random(6, 1024))},
+					"file7": TestFile{Content: string(restictest.Random(7, 1024))},
+					"file8": TestFile{Content: string(restictest.Random(8, 1024))},
+					"file9": TestFile{Content: string(restictest.Random(9, 1024))},
 				},
 			},
 			wantOpen: map[string]uint{
 				filepath.FromSlash("dir/file1"): 1,
 				filepath.FromSlash("dir/file2"): 1,
 				filepath.FromSlash("dir/file3"): 1,
+				filepath.FromSlash("dir/file4"): 1,
 				filepath.FromSlash("dir/file7"): 0,
 				filepath.FromSlash("dir/file8"): 0,
 				filepath.FromSlash("dir/file9"): 0,
 			},
-			failAfter: 5,
+			// fails four to six files were opened as the FileReadConcurrency allows for
+			// two queued files
+			failAfter: 4,
 			err:       testErr,
 		},
 	}
@@ -1879,7 +1929,10 @@ func TestArchiverAbortEarlyOnError(t *testing.T) {
 				err:        test.err,
 			}
 
-			arch := New(testRepo, testFS, Options{})
+			// at most two files may be queued
+			arch := New(testRepo, testFS, Options{
+				FileReadConcurrency: 2,
+			})
 
 			_, _, err := arch.Snapshot(ctx, []string{"."}, SnapshotOptions{Time: time.Now()})
 			if errors.Cause(err) != test.err {
@@ -1896,5 +1949,215 @@ func TestArchiverAbortEarlyOnError(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func snapshot(t testing.TB, repo restic.Repository, fs fs.FS, parent restic.ID, filename string) (restic.ID, *restic.Node) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	arch := New(repo, fs, Options{})
+
+	sopts := SnapshotOptions{
+		Time:           time.Now(),
+		ParentSnapshot: parent,
+	}
+	snapshot, snapshotID, err := arch.Snapshot(ctx, []string{filename}, sopts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tree, err := repo.LoadTree(ctx, *snapshot.Tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	node := tree.Find(filename)
+	if node == nil {
+		t.Fatalf("unable to find node for testfile in snapshot")
+	}
+
+	return snapshotID, node
+}
+
+func chmod(t testing.TB, filename string, mode os.FileMode) {
+	err := os.Chmod(filename, mode)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// StatFS allows overwriting what is returned by the Lstat function.
+type StatFS struct {
+	fs.FS
+
+	OverrideLstat    map[string]os.FileInfo
+	OnlyOverrideStat bool
+}
+
+func (fs *StatFS) Lstat(name string) (os.FileInfo, error) {
+	if !fs.OnlyOverrideStat {
+		if fi, ok := fs.OverrideLstat[fixpath(name)]; ok {
+			return fi, nil
+		}
+	}
+
+	return fs.FS.Lstat(name)
+}
+
+func (fs *StatFS) OpenFile(name string, flags int, perm os.FileMode) (fs.File, error) {
+	if fi, ok := fs.OverrideLstat[fixpath(name)]; ok {
+		f, err := fs.FS.OpenFile(name, flags, perm)
+		if err != nil {
+			return nil, err
+		}
+
+		wrappedFile := fileStat{
+			File: f,
+			fi:   fi,
+		}
+		return wrappedFile, nil
+	}
+
+	return fs.FS.OpenFile(name, flags, perm)
+}
+
+type fileStat struct {
+	fs.File
+	fi os.FileInfo
+}
+
+func (f fileStat) Stat() (os.FileInfo, error) {
+	return f.fi, nil
+}
+
+// used by wrapFileInfo, use untyped const in order to avoid having a version
+// of wrapFileInfo for each OS
+const (
+	mockFileInfoMode = 0400
+	mockFileInfoUID  = 51234
+	mockFileInfoGID  = 51235
+)
+
+func TestMetadataChanged(t *testing.T) {
+	files := TestDir{
+		"testfile": TestFile{
+			Content: "foo bar test file",
+		},
+	}
+
+	tempdir, repo, cleanup := prepareTempdirRepoSrc(t, files)
+	defer cleanup()
+
+	back := fs.TestChdir(t, tempdir)
+	defer back()
+
+	// get metadata
+	fi := lstat(t, "testfile")
+	want, err := restic.NodeFromFileInfo("testfile", fi)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fs := &StatFS{
+		FS: fs.Local{},
+		OverrideLstat: map[string]os.FileInfo{
+			"testfile": fi,
+		},
+	}
+
+	snapshotID, node2 := snapshot(t, repo, fs, restic.ID{}, "testfile")
+
+	// set some values so we can then compare the nodes
+	want.Content = node2.Content
+	want.Path = ""
+	if len(want.ExtendedAttributes) == 0 {
+		want.ExtendedAttributes = nil
+	}
+
+	want.AccessTime = want.ModTime
+
+	// make sure that metadata was recorded successfully
+	if !cmp.Equal(want, node2) {
+		t.Fatalf("metadata does not match:\n%v", cmp.Diff(want, node2))
+	}
+
+	// modify the mode by wrapping it in a new struct, uses the consts defined above
+	fs.OverrideLstat["testfile"] = wrapFileInfo(t, fi)
+
+	// set the override values in the 'want' node which
+	want.Mode = 0400
+	// ignore UID and GID on Windows
+	if runtime.GOOS != "windows" {
+		want.UID = 51234
+		want.GID = 51235
+	}
+	// no user and group name
+	want.User = ""
+	want.Group = ""
+
+	// make another snapshot
+	snapshotID, node3 := snapshot(t, repo, fs, snapshotID, "testfile")
+	// Override username and group to empty string - in case underlying system has user with UID 51234
+	// See https://github.com/restic/restic/issues/2372
+	node3.User = ""
+	node3.Group = ""
+
+	// make sure that metadata was recorded successfully
+	if !cmp.Equal(want, node3) {
+		t.Fatalf("metadata does not match:\n%v", cmp.Diff(want, node3))
+	}
+
+	// make sure the content matches
+	TestEnsureFileContent(context.Background(), t, repo, "testfile", node3, files["testfile"].(TestFile))
+
+	checker.TestCheckRepo(t, repo)
+}
+
+func TestRacyFileSwap(t *testing.T) {
+	files := TestDir{
+		"file": TestFile{
+			Content: "foo bar test file",
+		},
+	}
+
+	tempdir, repo, cleanup := prepareTempdirRepoSrc(t, files)
+	defer cleanup()
+
+	back := fs.TestChdir(t, tempdir)
+	defer back()
+
+	// get metadata of current folder
+	fi := lstat(t, ".")
+	tempfile := filepath.Join(tempdir, "file")
+
+	statfs := &StatFS{
+		FS: fs.Local{},
+		OverrideLstat: map[string]os.FileInfo{
+			tempfile: fi,
+		},
+		OnlyOverrideStat: true,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var tmb tomb.Tomb
+
+	arch := New(repo, fs.Track{FS: statfs}, Options{})
+	arch.Error = func(item string, fi os.FileInfo, err error) error {
+		t.Logf("archiver error as expected for %v: %v", item, err)
+		return err
+	}
+	arch.runWorkers(tmb.Context(ctx), &tmb)
+
+	// fs.Track will panic if the file was not closed
+	_, excluded, err := arch.Save(ctx, "/", tempfile, nil)
+	if err == nil {
+		t.Errorf("Save() should have failed")
+	}
+
+	if excluded {
+		t.Errorf("Save() excluded the node, that's unexpected")
 	}
 }

@@ -56,16 +56,6 @@ func verbose(f string, args ...interface{}) {
 	fmt.Printf(f, args...)
 }
 
-func run(cmd string, args ...string) {
-	c := exec.Command(cmd, args...)
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	err := c.Run()
-	if err != nil {
-		die("error running %s %s: %v", cmd, args, err)
-	}
-}
-
 func rm(file string) {
 	err := os.Remove(file)
 
@@ -78,26 +68,11 @@ func rm(file string) {
 	}
 }
 
-func rmdir(dir string) {
-	err := os.RemoveAll(dir)
-	if err != nil {
-		die("error removing %v: %v", dir, err)
-	}
-}
-
 func mkdir(dir string) {
 	err := os.MkdirAll(dir, 0755)
 	if err != nil {
 		die("mkdir %v: %v", dir, err)
 	}
-}
-
-func getwd() string {
-	pwd, err := os.Getwd()
-	if err != nil {
-		die("Getwd(): %v", err)
-	}
-	return pwd
 }
 
 func abs(dir string) string {
@@ -121,7 +96,6 @@ func build(sourceDir, outputDir, goos, goarch string) (filename string) {
 	outputFile := filepath.Join(outputDir, filename)
 
 	c := exec.Command("go", "build",
-		"-mod=vendor",
 		"-o", outputFile,
 		"-ldflags", "-s -w",
 		"-tags", "selfupdate",
@@ -251,7 +225,7 @@ func buildTargets(sourceDir, outputDir string, targets map[string][]string) {
 var defaultBuildTargets = map[string][]string{
 	"darwin":  []string{"386", "amd64"},
 	"freebsd": []string{"386", "amd64", "arm"},
-	"linux":   []string{"386", "amd64", "arm", "arm64"},
+	"linux":   []string{"386", "amd64", "arm", "arm64", "ppc64le"},
 	"openbsd": []string{"386", "amd64"},
 	"windows": []string{"386", "amd64"},
 }

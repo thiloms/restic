@@ -27,7 +27,13 @@ restic find --json "*.yml" "*.json"
 restic find --json --blob 420f620f b46ebe8a ddd38656
 restic find --show-pack-id --blob 420f620f
 restic find --tree 577c2bc9 f81f2e22 a62827a9
-restic find --pack 025c1d06`,
+restic find --pack 025c1d06
+
+EXIT STATUS
+===========
+
+Exit status is 0 if the command was successful, and non-zero if there was any error.
+`,
 	DisableAutoGenTag: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runFind(findOptions, globalOptions, args)
@@ -45,7 +51,7 @@ type FindOptions struct {
 	PackID, ShowPackID bool
 	CaseInsensitive    bool
 	ListLong           bool
-	Host               string
+	Hosts              []string
 	Paths              []string
 	Tags               restic.TagLists
 }
@@ -62,11 +68,11 @@ func init() {
 	f.BoolVar(&findOptions.BlobID, "blob", false, "pattern is a blob-ID")
 	f.BoolVar(&findOptions.TreeID, "tree", false, "pattern is a tree-ID")
 	f.BoolVar(&findOptions.PackID, "pack", false, "pattern is a pack-ID")
-	f.BoolVar(&findOptions.ShowPackID, "show-pack-id", false, "display the pack-ID the blobs belong to (with --blob)")
+	f.BoolVar(&findOptions.ShowPackID, "show-pack-id", false, "display the pack-ID the blobs belong to (with --blob or --tree)")
 	f.BoolVarP(&findOptions.CaseInsensitive, "ignore-case", "i", false, "ignore case for pattern")
 	f.BoolVarP(&findOptions.ListLong, "long", "l", false, "use a long listing format showing size and mode")
 
-	f.StringVarP(&findOptions.Host, "host", "H", "", "only consider snapshots for this `host`, when no snapshot ID is given")
+	f.StringArrayVarP(&findOptions.Hosts, "host", "H", nil, "only consider snapshots for this `host`, when no snapshot ID is given (can be specified multiple times)")
 	f.Var(&findOptions.Tags, "tag", "only consider snapshots which include this `taglist`, when no snapshot-ID is given")
 	f.StringArrayVar(&findOptions.Paths, "path", nil, "only consider snapshots which include this (absolute) `path`, when no snapshot-ID is given")
 }
@@ -150,7 +156,7 @@ func (s *statefulOutput) PrintPatternJSON(path string, node *restic.Node) {
 	if s.hits > 0 {
 		Printf(",")
 	}
-	Printf(string(b))
+	Print(string(b))
 	s.hits++
 }
 
@@ -160,9 +166,9 @@ func (s *statefulOutput) PrintPatternNormal(path string, node *restic.Node) {
 			Verbosef("\n")
 		}
 		s.oldsn = s.newsn
-		Verbosef("Found matching entries in snapshot %s\n", s.oldsn.ID().Str())
+		Verbosef("Found matching entries in snapshot %s from %s\n", s.oldsn.ID().Str(), s.oldsn.Time.Local().Format(TimeFormat))
 	}
-	Printf(formatNode(path, node, s.ListLong) + "\n")
+	Println(formatNode(path, node, s.ListLong))
 }
 
 func (s *statefulOutput) PrintPattern(path string, node *restic.Node) {
@@ -201,7 +207,7 @@ func (s *statefulOutput) PrintObjectJSON(kind, id, nodepath, treeID string, sn *
 	if s.hits > 0 {
 		Printf(",")
 	}
-	Printf(string(b))
+	Print(string(b))
 	s.hits++
 }
 
@@ -258,9 +264,13 @@ func (f *Finder) findInSnapshot(ctx context.Context, sn *restic.Snapshot) error 
 	}
 
 	f.out.newsn = sn
-	return walker.Walk(ctx, f.repo, *sn.Tree, f.ignoreTrees, func(_ restic.ID, nodepath string, node *restic.Node, err error) (bool, error) {
+	return walker.Walk(ctx, f.repo, *sn.Tree, f.ignoreTrees, func(parentTreeID restic.ID, nodepath string, node *restic.Node, err error) (bool, error) {
 		if err != nil {
-			return false, err
+			debug.Log("Error loading tree %v: %v", parentTreeID, err)
+
+			Printf("Unable to load tree %s\n ... which belongs to snapshot %s.\n", parentTreeID, sn.ID())
+
+			return false, walker.SkipNode
 		}
 
 		if node == nil {
@@ -340,7 +350,11 @@ func (f *Finder) findIDs(ctx context.Context, sn *restic.Snapshot) error {
 	f.out.newsn = sn
 	return walker.Walk(ctx, f.repo, *sn.Tree, f.ignoreTrees, func(parentTreeID restic.ID, nodepath string, node *restic.Node, err error) (bool, error) {
 		if err != nil {
-			return false, err
+			debug.Log("Error loading tree %v: %v", parentTreeID, err)
+
+			Printf("Unable to load tree %s\n ... which belongs to snapshot %s.\n", parentTreeID, sn.ID())
+
+			return false, walker.SkipNode
 		}
 
 		if node == nil {
@@ -442,27 +456,36 @@ func (f *Finder) packsToBlobs(ctx context.Context, packs []string) error {
 	return nil
 }
 
-func (f *Finder) findBlobsPacks(ctx context.Context) {
+func (f *Finder) findObjectPack(ctx context.Context, id string, t restic.BlobType) {
 	idx := f.repo.Index()
+
+	rid, err := restic.ParseID(id)
+	if err != nil {
+		Printf("Note: cannot find pack for object '%s', unable to parse ID: %v\n", id, err)
+		return
+	}
+
+	blobs, found := idx.Lookup(rid, t)
+	if !found {
+		Printf("Object %s not found in the index\n", rid.Str())
+		return
+	}
+
+	for _, b := range blobs {
+		if b.ID.Equal(rid) {
+			Printf("Object belongs to pack %s\n ... Pack %s: %s\n", b.PackID, b.PackID.Str(), b.String())
+			break
+		}
+	}
+}
+
+func (f *Finder) findObjectsPacks(ctx context.Context) {
 	for i := range f.blobIDs {
-		rid, err := restic.ParseID(i)
-		if err != nil {
-			Printf("Note: cannot find pack for blob '%s', unable to parse ID: %v\n", i, err)
-			continue
-		}
+		f.findObjectPack(ctx, i, restic.DataBlob)
+	}
 
-		blobs, found := idx.Lookup(rid, restic.DataBlob)
-		if !found {
-			Printf("Blob %s not found in the index\n", rid.Str())
-			continue
-		}
-
-		for _, b := range blobs {
-			if b.ID.Equal(rid) {
-				Printf("Blob belongs to pack %s\n ... Pack %s: %s\n", b.PackID, b.PackID.Str(), b.String())
-				break
-			}
-		}
+	for i := range f.treeIDs {
+		f.findObjectPack(ctx, i, restic.TreeBlob)
 	}
 }
 
@@ -544,7 +567,7 @@ func runFind(opts FindOptions, gopts GlobalOptions, args []string) error {
 		f.packsToBlobs(ctx, []string{f.pat.pattern[0]}) // TODO: support multiple packs
 	}
 
-	for sn := range FindFilteredSnapshots(ctx, repo, opts.Host, opts.Tags, opts.Paths, opts.Snapshots) {
+	for sn := range FindFilteredSnapshots(ctx, repo, opts.Hosts, opts.Tags, opts.Paths, opts.Snapshots) {
 		if f.blobIDs != nil || f.treeIDs != nil {
 			if err = f.findIDs(ctx, sn); err != nil && err.Error() != "OK" {
 				return err
@@ -557,8 +580,8 @@ func runFind(opts FindOptions, gopts GlobalOptions, args []string) error {
 	}
 	f.out.Finish()
 
-	if opts.ShowPackID && f.blobIDs != nil {
-		f.findBlobsPacks(ctx)
+	if opts.ShowPackID && (f.blobIDs != nil || f.treeIDs != nil) {
+		f.findObjectsPacks(ctx)
 	}
 
 	return nil

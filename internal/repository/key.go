@@ -18,7 +18,7 @@ import (
 
 var (
 	// ErrNoKeyFound is returned when no key for the repository could be decrypted.
-	ErrNoKeyFound = errors.Fatal("wrong password or no key found")
+	ErrNoKeyFound = errors.New("wrong password or no key found")
 
 	// ErrMaxKeysReached is returned when the maximum number of keys was checked and no key could be found.
 	ErrMaxKeysReached = errors.Fatal("maximum number of keys reached")
@@ -184,7 +184,7 @@ func SearchKey(ctx context.Context, s *Repository, password string, maxKeys int,
 // LoadKey loads a key from the backend.
 func LoadKey(ctx context.Context, s *Repository, name string) (k *Key, err error) {
 	h := restic.Handle{Type: restic.KeyFile, Name: name}
-	data, err := backend.LoadAll(ctx, s.be, h)
+	data, err := backend.LoadAll(ctx, nil, s.be, h)
 	if err != nil {
 		return nil, err
 	}

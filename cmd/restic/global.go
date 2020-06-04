@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -33,11 +34,12 @@ import (
 
 	"github.com/restic/restic/internal/errors"
 
-	"golang.org/x/crypto/ssh/terminal"
 	"os/exec"
+
+	"golang.org/x/crypto/ssh/terminal"
 )
 
-var version = "0.9.4-dev (compiled manually)"
+var version = "0.9.6-dev (compiled manually)"
 
 // TimeFormat is the format used for all timestamps printed by restic.
 const TimeFormat = "2006-01-02 15:04:05"
@@ -83,6 +85,8 @@ var globalOptions = GlobalOptions{
 	stderr: os.Stderr,
 }
 
+var isReadingPassword bool
+
 func init() {
 	var cancel context.CancelFunc
 	globalOptions.ctx, cancel = context.WithCancel(context.Background())
@@ -92,18 +96,18 @@ func init() {
 	})
 
 	f := cmdRoot.PersistentFlags()
-	f.StringVarP(&globalOptions.Repo, "repo", "r", os.Getenv("RESTIC_REPOSITORY"), "repository to backup to or restore from (default: $RESTIC_REPOSITORY)")
-	f.StringVarP(&globalOptions.PasswordFile, "password-file", "p", os.Getenv("RESTIC_PASSWORD_FILE"), "read the repository password from a file (default: $RESTIC_PASSWORD_FILE)")
-	f.StringVarP(&globalOptions.KeyHint, "key-hint", "", os.Getenv("RESTIC_KEY_HINT"), "key ID of key to try decrypting first (default: $RESTIC_KEY_HINT)")
-	f.StringVarP(&globalOptions.PasswordCommand, "password-command", "", os.Getenv("RESTIC_PASSWORD_COMMAND"), "specify a shell command to obtain a password (default: $RESTIC_PASSWORD_COMMAND)")
+	f.StringVarP(&globalOptions.Repo, "repo", "r", os.Getenv("RESTIC_REPOSITORY"), "`repository` to backup to or restore from (default: $RESTIC_REPOSITORY)")
+	f.StringVarP(&globalOptions.PasswordFile, "password-file", "p", os.Getenv("RESTIC_PASSWORD_FILE"), "read the repository password from a `file` (default: $RESTIC_PASSWORD_FILE)")
+	f.StringVarP(&globalOptions.KeyHint, "key-hint", "", os.Getenv("RESTIC_KEY_HINT"), "`key` ID of key to try decrypting first (default: $RESTIC_KEY_HINT)")
+	f.StringVarP(&globalOptions.PasswordCommand, "password-command", "", os.Getenv("RESTIC_PASSWORD_COMMAND"), "specify a shell `command` to obtain a password (default: $RESTIC_PASSWORD_COMMAND)")
 	f.BoolVarP(&globalOptions.Quiet, "quiet", "q", false, "do not output comprehensive progress report")
 	f.CountVarP(&globalOptions.Verbose, "verbose", "v", "be verbose (specify --verbose multiple times or level `n`)")
 	f.BoolVar(&globalOptions.NoLock, "no-lock", false, "do not lock the repo, this allows some operations on read-only repos")
 	f.BoolVarP(&globalOptions.JSON, "json", "", false, "set output mode to JSON for commands that support it")
-	f.StringVar(&globalOptions.CacheDir, "cache-dir", "", "set the cache directory. (default: use system default cache directory)")
+	f.StringVar(&globalOptions.CacheDir, "cache-dir", "", "set the cache `directory`. (default: use system default cache directory)")
 	f.BoolVar(&globalOptions.NoCache, "no-cache", false, "do not use a local cache")
 	f.StringSliceVar(&globalOptions.CACerts, "cacert", nil, "`file` to load root certificates from (default: use system certificates)")
-	f.StringVar(&globalOptions.TLSClientCert, "tls-client-cert", "", "path to a file containing PEM encoded TLS client certificate and private key")
+	f.StringVar(&globalOptions.TLSClientCert, "tls-client-cert", "", "path to a `file` containing PEM encoded TLS client certificate and private key")
 	f.BoolVar(&globalOptions.CleanupCache, "cleanup-cache", false, "auto remove old cache directories")
 	f.IntVar(&globalOptions.LimitUploadKb, "limit-upload", 0, "limits uploads to a maximum rate in KiB/s. (default: unlimited)")
 	f.IntVar(&globalOptions.LimitDownloadKb, "limit-download", 0, "limits downloads to a maximum rate in KiB/s. (default: unlimited)")
@@ -144,7 +148,10 @@ func stdoutTerminalWidth() int {
 }
 
 // restoreTerminal installs a cleanup handler that restores the previous
-// terminal state on exit.
+// terminal state on exit. This handler is only intended to restore the
+// terminal configuration if restic exits after receiving a signal. A regular
+// program execution must revert changes to the terminal configuration itself.
+// The terminal configuration is only restored while reading a password.
 func restoreTerminal() {
 	if !stdoutIsTerminal() {
 		return
@@ -158,9 +165,17 @@ func restoreTerminal() {
 	}
 
 	AddCleanupHandler(func() error {
+		// Restoring the terminal configuration while restic runs in the
+		// background, causes restic to get stopped on unix systems with
+		// a SIGTTOU signal. Thus only restore the terminal settings if
+		// they might have been modified, which is the case while reading
+		// a password.
+		if !isReadingPassword {
+			return nil
+		}
 		err := checkErrno(terminal.Restore(fd, state))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "unable to get restore terminal state: %#+v\n", err)
+			fmt.Fprintf(os.Stderr, "unable to restore terminal state: %v\n", err)
 		}
 		return err
 	})
@@ -182,6 +197,22 @@ func ClearLine() string {
 // Printf writes the message to the configured stdout stream.
 func Printf(format string, args ...interface{}) {
 	_, err := fmt.Fprintf(globalOptions.stdout, format, args...)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "unable to write to stdout: %v\n", err)
+	}
+}
+
+// Print writes the message to the configured stdout stream.
+func Print(args ...interface{}) {
+	_, err := fmt.Fprint(globalOptions.stdout, args...)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "unable to write to stdout: %v\n", err)
+	}
+}
+
+// Println writes the message to the configured stdout stream.
+func Println(args ...interface{}) {
+	_, err := fmt.Fprintln(globalOptions.stdout, args...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to write to stdout: %v\n", err)
 	}
@@ -230,7 +261,7 @@ func Warnf(format string, args ...interface{}) {
 // Exitf uses Warnf to write the message and then terminates the process with
 // the given exit code.
 func Exitf(exitcode int, format string, args ...interface{}) {
-	if format[len(format)-1] != '\n' {
+	if !(strings.HasSuffix(format, "\n")) {
 		format += "\n"
 	}
 
@@ -273,15 +304,10 @@ func resolvePassword(opts GlobalOptions) (string, error) {
 
 // readPassword reads the password from the given reader directly.
 func readPassword(in io.Reader) (password string, err error) {
-	buf := make([]byte, 1000)
-	n, err := io.ReadFull(in, buf)
-	buf = buf[:n]
+	sc := bufio.NewScanner(in)
+	sc.Scan()
 
-	if err != nil && errors.Cause(err) != io.ErrUnexpectedEOF {
-		return "", errors.Wrap(err, "ReadFull")
-	}
-
-	return strings.TrimRight(string(buf), "\r\n"), nil
+	return sc.Text(), errors.Wrap(err, "Scan")
 }
 
 // readPasswordTerminal reads the password from the given reader which must be a
@@ -289,7 +315,9 @@ func readPassword(in io.Reader) (password string, err error) {
 // password.
 func readPasswordTerminal(in *os.File, out io.Writer, prompt string) (password string, err error) {
 	fmt.Fprint(out, prompt)
+	isReadingPassword = true
 	buf, err := terminal.ReadPassword(int(in.Fd()))
+	isReadingPassword = false
 	fmt.Fprintln(out)
 	if err != nil {
 		return "", errors.Wrap(err, "ReadPassword")
@@ -323,7 +351,7 @@ func ReadPassword(opts GlobalOptions, prompt string) (string, error) {
 	}
 
 	if len(password) == 0 {
-		return "", errors.Fatal("an empty password is not a password")
+		return "", errors.New("an empty password is not a password")
 	}
 
 	return password, nil
@@ -336,13 +364,15 @@ func ReadPasswordTwice(gopts GlobalOptions, prompt1, prompt2 string) (string, er
 	if err != nil {
 		return "", err
 	}
-	pw2, err := ReadPassword(gopts, prompt2)
-	if err != nil {
-		return "", err
-	}
+	if stdinIsTerminal() {
+		pw2, err := ReadPassword(gopts, prompt2)
+		if err != nil {
+			return "", err
+		}
 
-	if pw1 != pw2 {
-		return "", errors.Fatal("passwords do not match")
+		if pw1 != pw2 {
+			return "", errors.Fatal("passwords do not match")
+		}
 	}
 
 	return pw1, nil
@@ -367,14 +397,32 @@ func OpenRepository(opts GlobalOptions) (*repository.Repository, error) {
 
 	s := repository.New(be)
 
-	opts.password, err = ReadPassword(opts, "enter password for repository: ")
-	if err != nil {
-		return nil, err
+	passwordTriesLeft := 1
+	if stdinIsTerminal() && opts.password == "" {
+		passwordTriesLeft = 3
 	}
 
-	err = s.SearchKey(opts.ctx, opts.password, maxKeys, opts.KeyHint)
+	for ; passwordTriesLeft > 0; passwordTriesLeft-- {
+		opts.password, err = ReadPassword(opts, "enter password for repository: ")
+		if err != nil && passwordTriesLeft > 1 {
+			opts.password = ""
+			fmt.Printf("%s. Try again\n", err)
+		}
+		if err != nil {
+			continue
+		}
+
+		err = s.SearchKey(opts.ctx, opts.password, maxKeys, opts.KeyHint)
+		if err != nil && passwordTriesLeft > 1 {
+			opts.password = ""
+			fmt.Printf("%s. Try again\n", err)
+		}
+	}
 	if err != nil {
-		return nil, err
+		if errors.IsFatal(err) {
+			return nil, err
+		}
+		return nil, errors.Fatalf("%s", err)
 	}
 
 	if stdoutIsTerminal() && !opts.JSON {
@@ -427,7 +475,7 @@ func OpenRepository(opts GlobalOptions) (*repository.Repository, error) {
 		}
 	} else {
 		if stdoutIsTerminal() {
-			Verbosef("found %d old cache directories in %v, pass --cleanup-cache to remove them\n",
+			Verbosef("found %d old cache directories in %v, run `restic cache --cleanup` to remove them\n",
 				len(oldCacheDirs), c.Base)
 		}
 	}
@@ -466,6 +514,10 @@ func parseConfig(loc location.Location, opts options.Options) (interface{}, erro
 
 		if cfg.Secret == "" {
 			cfg.Secret = os.Getenv("AWS_SECRET_ACCESS_KEY")
+		}
+
+		if cfg.Region == "" {
+			cfg.Region = os.Getenv("AWS_DEFAULT_REGION")
 		}
 
 		if err := opts.Apply(loc.Scheme, &cfg); err != nil {

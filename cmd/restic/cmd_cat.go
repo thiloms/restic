@@ -18,6 +18,11 @@ var cmdCat = &cobra.Command{
 	Short: "Print internal objects to stdout",
 	Long: `
 The "cat" command is used to print internal objects to stdout.
+
+EXIT STATUS
+===========
+
+Exit status is 0 if the command was successful, and non-zero if there was any error.
 `,
 	DisableAutoGenTag: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -74,7 +79,7 @@ func runCat(gopts GlobalOptions, args []string) error {
 		fmt.Println(string(buf))
 		return nil
 	case "index":
-		buf, err := repo.LoadAndDecrypt(gopts.ctx, restic.IndexFile, id)
+		buf, err := repo.LoadAndDecrypt(gopts.ctx, nil, restic.IndexFile, id)
 		if err != nil {
 			return err
 		}
@@ -99,7 +104,7 @@ func runCat(gopts GlobalOptions, args []string) error {
 		return nil
 	case "key":
 		h := restic.Handle{Type: restic.KeyFile, Name: id.String()}
-		buf, err := backend.LoadAll(gopts.ctx, repo.Backend(), h)
+		buf, err := backend.LoadAll(gopts.ctx, nil, repo.Backend(), h)
 		if err != nil {
 			return err
 		}
@@ -150,7 +155,7 @@ func runCat(gopts GlobalOptions, args []string) error {
 	switch tpe {
 	case "pack":
 		h := restic.Handle{Type: restic.DataFile, Name: id.String()}
-		buf, err := backend.LoadAll(gopts.ctx, repo.Backend(), h)
+		buf, err := backend.LoadAll(gopts.ctx, nil, repo.Backend(), h)
 		if err != nil {
 			return err
 		}
@@ -165,18 +170,15 @@ func runCat(gopts GlobalOptions, args []string) error {
 
 	case "blob":
 		for _, t := range []restic.BlobType{restic.DataBlob, restic.TreeBlob} {
-			list, found := repo.Index().Lookup(id, t)
+			_, found := repo.Index().Lookup(id, t)
 			if !found {
 				continue
 			}
-			blob := list[0]
 
-			buf := make([]byte, blob.Length)
-			n, err := repo.LoadBlob(gopts.ctx, t, id, buf)
+			buf, err := repo.LoadBlob(gopts.ctx, t, id, nil)
 			if err != nil {
 				return err
 			}
-			buf = buf[:n]
 
 			_, err = os.Stdout.Write(buf)
 			return err

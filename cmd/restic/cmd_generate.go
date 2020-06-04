@@ -12,8 +12,13 @@ var cmdGenerate = &cobra.Command{
 	Use:   "generate [command]",
 	Short: "Generate manual pages and auto-completion files (bash, zsh)",
 	Long: `
-The "generate" command writes automatically generated files like the man pages
+The "generate" command writes automatically generated files (like the man pages
 and the auto-completion files for bash and zsh).
+
+EXIT STATUS
+===========
+
+Exit status is 0 if the command was successful, and non-zero if there was any error.
 `,
 	DisableAutoGenTag: true,
 	RunE:              runGenerate,

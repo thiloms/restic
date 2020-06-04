@@ -142,6 +142,9 @@ is not slowed down, which is particularly useful for servers.
 Creating new repo on a Synology NAS via sftp fails
 --------------------------------------------------
 
+For using restic with a Synology NAS via sftp, please make sure that the
+specified path is absolute, it must start with a slash (``/``).
+
 Sometimes creating a new restic repository on a Synology NAS via sftp fails
 with an error similar to the following:
 
@@ -160,8 +163,8 @@ different than the directory structure on the device and maybe even as exposed
 via other protocols.
 
 
-Try removing the /volume1 prefix in your paths. If this does not work, use sftp
-and ls to explore the SFTP file system hierarchy on your NAS.
+Try removing the ``/volume1`` prefix in your paths. If this does not work, use
+sftp and ls to explore the SFTP file system hierarchy on your NAS.
 
 The following may work:
 
@@ -172,4 +175,9 @@ The following may work:
 Why does restic perform so poorly on Windows?
 ---------------------------------------------
 
-In some cases the real-time protection of antivirus software can interfere with restic's operations. If you are experiencing bad performance you can try to temporarily disable your antivirus software to find out if it is the cause for your performance problems.
+In some cases the real-time protection of antivirus software can interfere with
+restic's operations. If you are experiencing bad performance you can try to
+temporarily disable your antivirus software to find out if it is the cause for
+your performance problems. If you are certain that the antivirus software is
+the cause for this and you want to gain maximum performance, you have to add
+the restic binary to an exclusions list within the antivirus software.

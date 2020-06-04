@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 
 	"github.com/spf13/cobra"
 
@@ -27,7 +26,13 @@ var cmdDebugDump = &cobra.Command{
 	Short: "Dump data structures",
 	Long: `
 The "dump" command dumps data structures from the repository as JSON objects. It
-is used for debugging purposes only.`,
+is used for debugging purposes only.
+
+EXIT STATUS
+===========
+
+Exit status is 0 if the command was successful, and non-zero if there was any error.
+`,
 	DisableAutoGenTag: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runDebugDump(globalOptions, args)
@@ -84,7 +89,7 @@ func printPacks(repo *repository.Repository, wr io.Writer) error {
 
 		blobs, err := pack.List(repo.Key(), restic.ReaderAt(repo.Backend(), h), size)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error for pack %v: %v\n", id.Str(), err)
+			fmt.Fprintf(globalOptions.stderr, "error for pack %v: %v\n", id.Str(), err)
 			return nil
 		}
 
@@ -101,13 +106,11 @@ func printPacks(repo *repository.Repository, wr io.Writer) error {
 			}
 		}
 
-		return prettyPrintJSON(os.Stdout, p)
+		return prettyPrintJSON(wr, p)
 	})
-
-	return nil
 }
 
-func dumpIndexes(repo restic.Repository) error {
+func dumpIndexes(repo restic.Repository, wr io.Writer) error {
 	return repo.List(context.TODO(), restic.IndexFile, func(id restic.ID, size int64) error {
 		fmt.Printf("index_id: %v\n", id)
 
@@ -116,7 +119,7 @@ func dumpIndexes(repo restic.Repository) error {
 			return err
 		}
 
-		return idx.Dump(os.Stdout)
+		return idx.Dump(wr)
 	})
 }
 
@@ -138,29 +141,24 @@ func runDebugDump(gopts GlobalOptions, args []string) error {
 		}
 	}
 
-	err = repo.LoadIndex(gopts.ctx)
-	if err != nil {
-		return err
-	}
-
 	tpe := args[0]
 
 	switch tpe {
 	case "indexes":
-		return dumpIndexes(repo)
+		return dumpIndexes(repo, gopts.stdout)
 	case "snapshots":
-		return debugPrintSnapshots(repo, os.Stdout)
+		return debugPrintSnapshots(repo, gopts.stdout)
 	case "packs":
-		return printPacks(repo, os.Stdout)
+		return printPacks(repo, gopts.stdout)
 	case "all":
 		fmt.Printf("snapshots:\n")
-		err := debugPrintSnapshots(repo, os.Stdout)
+		err := debugPrintSnapshots(repo, gopts.stdout)
 		if err != nil {
 			return err
 		}
 
 		fmt.Printf("\nindexes:\n")
-		err = dumpIndexes(repo)
+		err = dumpIndexes(repo, gopts.stdout)
 		if err != nil {
 			return err
 		}

@@ -1,3 +1,248 @@
+Changelog for restic 0.9.6 (2019-11-22)
+=======================================
+
+The following sections list the changes in restic 0.9.6 relevant to
+restic users. The changes are ordered by importance.
+
+Summary
+-------
+
+ * Fix #2063: Allow absolute path for filename when backing up from stdin
+ * Fix #2174: Save files with invalid timestamps
+ * Fix #2249: Read fresh metadata for unmodified files
+ * Fix #2301: Add upper bound for t in --read-data-subset=n/t
+ * Fix #2321: Check errors when loading index files
+ * Enh #2179: Use ctime when checking for file changes
+ * Enh #2306: Allow multiple retries for interactive password input
+ * Enh #2330: Make `--group-by` accept both singular and plural
+ * Enh #2350: Add option to configure S3 region
+
+Details
+-------
+
+ * Bugfix #2063: Allow absolute path for filename when backing up from stdin
+
+   When backing up from stdin, handle directory path for `--stdin-filename`. This can be used to
+   specify the full path for the backed-up file.
+
+   https://github.com/restic/restic/issues/2063
+
+ * Bugfix #2174: Save files with invalid timestamps
+
+   When restic reads invalid timestamps (year is before 0000 or after 9999) it refused to read and
+   archive the file. We've changed the behavior and will now save modified timestamps with the
+   year set to either 0000 or 9999, the rest of the timestamp stays the same, so the file will be saved
+   (albeit with a bogus timestamp).
+
+   https://github.com/restic/restic/issues/2174
+   https://github.com/restic/restic/issues/1173
+
+ * Bugfix #2249: Read fresh metadata for unmodified files
+
+   Restic took all metadata for files which were detected as unmodified, not taking into account
+   changed metadata (ownership, mode). This is now corrected.
+
+   https://github.com/restic/restic/issues/2249
+   https://github.com/restic/restic/pull/2252
+
+ * Bugfix #2301: Add upper bound for t in --read-data-subset=n/t
+
+   256 is the effective maximum for t, but restic would allow larger values, leading to strange
+   behavior.
+
+   https://github.com/restic/restic/issues/2301
+   https://github.com/restic/restic/pull/2304
+
+ * Bugfix #2321: Check errors when loading index files
+
+   Restic now checks and handles errors which occur when loading index files, the missing check
+   leads to odd errors (and a stack trace printed to users) later. This was reported in the forum.
+
+   https://github.com/restic/restic/pull/2321
+   https://forum.restic.net/t/check-rebuild-index-prune/1848/13
+
+ * Enhancement #2179: Use ctime when checking for file changes
+
+   Previously, restic only checked a file's mtime (along with other non-timestamp metadata) to
+   decide if a file has changed. This could cause restic to not notice that a file has changed (and
+   therefore continue to store the old version, as opposed to the modified version) if something
+   edits the file and then resets the timestamp. Restic now also checks the ctime of files, so any
+   modifications to a file should be noticed, and the modified file will be backed up. The ctime
+   check will be disabled if the --ignore-inode flag was given.
+
+   If this change causes problems for you, please open an issue, and we can look in to adding a
+   seperate flag to disable just the ctime check.
+
+   https://github.com/restic/restic/issues/2179
+   https://github.com/restic/restic/pull/2212
+
+ * Enhancement #2306: Allow multiple retries for interactive password input
+
+   Restic used to quit if the repository password was typed incorrectly once. Restic will now ask
+   the user again for the repository password if typed incorrectly. The user will now get three
+   tries to input the correct password before restic quits.
+
+   https://github.com/restic/restic/issues/2306
+
+ * Enhancement #2330: Make `--group-by` accept both singular and plural
+
+   One can now use the values `host`/`hosts`, `path`/`paths` and `tag` / `tags` interchangeably
+   in the `--group-by` argument.
+
+   https://github.com/restic/restic/issues/2330
+
+ * Enhancement #2350: Add option to configure S3 region
+
+   We've added a new option for setting the region when accessing an S3-compatible service. For
+   some providers, it is required to set this to a valid value. You can do that either by setting the
+   environment variable `AWS_DEFAULT_REGION` or using the option `s3.region`, e.g. like this:
+   `-o s3.region="us-east-1"`.
+
+   https://github.com/restic/restic/pull/2350
+
+
+Changelog for restic 0.9.5 (2019-04-23)
+=======================================
+
+The following sections list the changes in restic 0.9.5 relevant to
+restic users. The changes are ordered by importance.
+
+Summary
+-------
+
+ * Fix #2135: Return error when no bytes could be read from stdin
+ * Fix #2181: Don't cancel timeout after 30 seconds for self-update
+ * Fix #2203: Fix reading passwords from stdin
+ * Fix #2224: Don't abort the find command when a tree can't be loaded
+ * Enh #1895: Add case insensitive include & exclude options
+ * Enh #1937: Support streaming JSON output for backup
+ * Enh #2155: Add Openstack application credential auth for Swift
+ * Enh #2184: Add --json support to forget command
+ * Enh #2037: Add group-by option to snapshots command
+ * Enh #2124: Ability to dump folders to tar via stdout
+ * Enh #2139: Return error if no bytes could be read for `backup --stdin`
+ * Enh #2205: Add --ignore-inode option to backup cmd
+ * Enh #2220: Add config option to set S3 storage class
+
+Details
+-------
+
+ * Bugfix #2135: Return error when no bytes could be read from stdin
+
+   We assume that users reading backup data from stdin want to know when no data could be read, so now
+   restic returns an error when `backup --stdin` is called but no bytes could be read. Usually,
+   this means that an earlier command in a pipe has failed. The documentation was amended and now
+   recommends setting the `pipefail` option (`set -o pipefail`).
+
+   https://github.com/restic/restic/pull/2135
+   https://github.com/restic/restic/pull/2139
+
+ * Bugfix #2181: Don't cancel timeout after 30 seconds for self-update
+
+   https://github.com/restic/restic/issues/2181
+
+ * Bugfix #2203: Fix reading passwords from stdin
+
+   Passwords for the `init`, `key add`, and `key passwd` commands can now be read from
+   non-terminal stdin.
+
+   https://github.com/restic/restic/issues/2203
+
+ * Bugfix #2224: Don't abort the find command when a tree can't be loaded
+
+   Change the find command so that missing trees don't result in a crash. Instead, the error is
+   logged to the debug log, and the tree ID is displayed along with the snapshot it belongs to. This
+   makes it possible to recover repositories that are missing trees by forgetting the snapshots
+   they are used in.
+
+   https://github.com/restic/restic/issues/2224
+
+ * Enhancement #1895: Add case insensitive include & exclude options
+
+   The backup and restore commands now have --iexclude and --iinclude flags as case insensitive
+   variants of --exclude and --include.
+
+   https://github.com/restic/restic/issues/1895
+   https://github.com/restic/restic/pull/2032
+
+ * Enhancement #1937: Support streaming JSON output for backup
+
+   We've added support for getting machine-readable status output during backup, just pass the
+   flag `--json` for `restic backup` and restic will output a stream of JSON objects which contain
+   the current progress.
+
+   https://github.com/restic/restic/issues/1937
+   https://github.com/restic/restic/pull/1944
+
+ * Enhancement #2155: Add Openstack application credential auth for Swift
+
+   Since Openstack Queens Identity (auth V3) service supports an application credential auth
+   method. It allows to create a technical account with the limited roles. This commit adds an
+   application credential authentication method for the Swift backend.
+
+   https://github.com/restic/restic/issues/2155
+
+ * Enhancement #2184: Add --json support to forget command
+
+   The forget command now supports the --json argument, outputting the information about what is
+   (or would-be) kept and removed from the repository.
+
+   https://github.com/restic/restic/issues/2184
+   https://github.com/restic/restic/pull/2185
+
+ * Enhancement #2037: Add group-by option to snapshots command
+
+   We have added an option to group the output of the snapshots command, similar to the output of the
+   forget command. The option has been called "--group-by" and accepts any combination of the
+   values "host", "paths" and "tags", separated by commas. Default behavior (not specifying
+   --group-by) has not been changed. We have added support of the grouping to the JSON output.
+
+   https://github.com/restic/restic/issues/2037
+   https://github.com/restic/restic/pull/2087
+
+ * Enhancement #2124: Ability to dump folders to tar via stdout
+
+   We've added the ability to dump whole folders to stdout via the `dump` command. Restic now
+   requires at least Go 1.10 due to a limitation of the standard library for Go <= 1.9.
+
+   https://github.com/restic/restic/issues/2123
+   https://github.com/restic/restic/pull/2124
+
+ * Enhancement #2139: Return error if no bytes could be read for `backup --stdin`
+
+   When restic is used to backup the output of a program, like `mysqldump | restic backup --stdin`,
+   it now returns an error if no bytes could be read at all. This catches the failure case when
+   `mysqldump` failed for some reason and did not output any data to stdout.
+
+   https://github.com/restic/restic/pull/2139
+
+ * Enhancement #2205: Add --ignore-inode option to backup cmd
+
+   This option handles backup of virtual filesystems that do not keep fixed inodes for files, like
+   Fuse-based, pCloud, etc. Ignoring inode changes allows to consider the file as unchanged if
+   last modification date and size are unchanged.
+
+   https://github.com/restic/restic/issues/1631
+   https://github.com/restic/restic/pull/2205
+   https://github.com/restic/restic/pull/2047
+
+ * Enhancement #2220: Add config option to set S3 storage class
+
+   The `s3.storage-class` option can be passed to restic (using `-o`) to specify the storage
+   class to be used for S3 objects created by restic.
+
+   The storage class is passed as-is to S3, so it needs to be understood by the API. On AWS, it can be
+   one of `STANDARD`, `STANDARD_IA`, `ONEZONE_IA`, `INTELLIGENT_TIERING` and
+   `REDUCED_REDUNDANCY`. If unspecified, the default storage class is used (`STANDARD` on
+   AWS).
+
+   You can mix storage classes in the same bucket, and the setting isn't stored in the restic
+   repository, so be sure to specify it with each command that writes to S3.
+
+   https://github.com/restic/restic/issues/706
+   https://github.com/restic/restic/pull/2220
+
+
 Changelog for restic 0.9.4 (2019-01-06)
 =======================================
 
@@ -1115,8 +1360,8 @@ Details
    the latest version of restic.
 
    Exploiting the vulnerability requires a Linux/Unix system which saves backups via restic and
-   a Windows systems which restores files from the repo. In addition, the attackers need to be able
-   to create create files with arbitrary names which are then saved to the restic repo. For
+   a Windows systems which restores files from the repo. In addition, the attackers need to be
+   able to create files with arbitrary names which are then saved to the restic repo. For
    example, by creating a file named "..\test.txt" (which is a perfectly legal filename on Linux)
    and restoring a snapshot containing this file on Windows, it would be written to the parent of
    the target directory.

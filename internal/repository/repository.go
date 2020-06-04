@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 
-	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/cache"
 	"github.com/restic/restic/internal/crypto"
 	"github.com/restic/restic/internal/debug"
@@ -18,6 +17,7 @@ import (
 	"github.com/restic/restic/internal/hashing"
 	"github.com/restic/restic/internal/pack"
 	"github.com/restic/restic/internal/restic"
+	"golang.org/x/sync/errgroup"
 )
 
 // Repository is used to access a repository in a backend.
@@ -66,15 +66,29 @@ func (r *Repository) PrefixLength(t restic.FileType) (int, error) {
 	return restic.PrefixLength(r.be, t)
 }
 
-// LoadAndDecrypt loads and decrypts data identified by t and id from the
-// backend.
-func (r *Repository) LoadAndDecrypt(ctx context.Context, t restic.FileType, id restic.ID) (buf []byte, err error) {
+// LoadAndDecrypt loads and decrypts the file with the given type and ID, using
+// the supplied buffer (which must be empty). If the buffer is nil, a new
+// buffer will be allocated and returned.
+func (r *Repository) LoadAndDecrypt(ctx context.Context, buf []byte, t restic.FileType, id restic.ID) ([]byte, error) {
+	if len(buf) != 0 {
+		panic("buf is not empty")
+	}
+
 	debug.Log("load %v with id %v", t, id)
 
 	h := restic.Handle{Type: t, Name: id.String()}
-	buf, err = backend.LoadAll(ctx, r.be, h)
+	err := r.be.Load(ctx, h, 0, 0, func(rd io.Reader) error {
+		// make sure this call is idempotent, in case an error occurs
+		wr := bytes.NewBuffer(buf[:0])
+		_, cerr := io.Copy(wr, rd)
+		if cerr != nil {
+			return cerr
+		}
+		buf = wr.Bytes()
+		return nil
+	})
+
 	if err != nil {
-		debug.Log("error loading %v: %v", h, err)
 		return nil, err
 	}
 
@@ -97,6 +111,11 @@ func (r *Repository) sortCachedPacks(blobs []restic.PackedBlob) []restic.PackedB
 		return blobs
 	}
 
+	// no need to sort a list with one element
+	if len(blobs) == 1 {
+		return blobs
+	}
+
 	cached := make([]restic.PackedBlob, 0, len(blobs)/2)
 	noncached := make([]restic.PackedBlob, 0, len(blobs)/2)
 
@@ -111,17 +130,16 @@ func (r *Repository) sortCachedPacks(blobs []restic.PackedBlob) []restic.PackedB
 	return append(cached, noncached...)
 }
 
-// loadBlob tries to load and decrypt content identified by t and id from a
-// pack from the backend, the result is stored in plaintextBuf, which must be
-// large enough to hold the complete blob.
-func (r *Repository) loadBlob(ctx context.Context, id restic.ID, t restic.BlobType, plaintextBuf []byte) (int, error) {
-	debug.Log("load %v with id %v (buf len %v, cap %d)", t, id, len(plaintextBuf), cap(plaintextBuf))
+// LoadBlob loads a blob of type t from the repository.
+// It may use all of buf[:cap(buf)] as scratch space.
+func (r *Repository) LoadBlob(ctx context.Context, t restic.BlobType, id restic.ID, buf []byte) ([]byte, error) {
+	debug.Log("load %v with id %v (buf len %v, cap %d)", t, id, len(buf), cap(buf))
 
 	// lookup packs
 	blobs, found := r.idx.Lookup(id, t)
 	if !found {
 		debug.Log("id %v not found in index", id)
-		return 0, errors.Errorf("id %v not found in repository", id)
+		return nil, errors.Errorf("id %v not found in repository", id)
 	}
 
 	// try cached pack files first
@@ -138,13 +156,14 @@ func (r *Repository) loadBlob(ctx context.Context, id restic.ID, t restic.BlobTy
 		// load blob from pack
 		h := restic.Handle{Type: restic.DataFile, Name: blob.PackID.String()}
 
-		if uint(cap(plaintextBuf)) < blob.Length {
-			return 0, errors.Errorf("buffer is too small: %v < %v", cap(plaintextBuf), blob.Length)
+		switch {
+		case cap(buf) < int(blob.Length):
+			buf = make([]byte, blob.Length)
+		case len(buf) != int(blob.Length):
+			buf = buf[:blob.Length]
 		}
 
-		plaintextBuf = plaintextBuf[:blob.Length]
-
-		n, err := restic.ReadAt(ctx, r.be, h, int64(blob.Offset), plaintextBuf)
+		n, err := restic.ReadAt(ctx, r.be, h, int64(blob.Offset), buf)
 		if err != nil {
 			debug.Log("error loading blob %v: %v", blob, err)
 			lastError = err
@@ -159,7 +178,7 @@ func (r *Repository) loadBlob(ctx context.Context, id restic.ID, t restic.BlobTy
 		}
 
 		// decrypt
-		nonce, ciphertext := plaintextBuf[:r.key.NonceSize()], plaintextBuf[r.key.NonceSize():]
+		nonce, ciphertext := buf[:r.key.NonceSize()], buf[r.key.NonceSize():]
 		plaintext, err := r.key.Open(ciphertext[:0], nonce, ciphertext, nil)
 		if err != nil {
 			lastError = errors.Errorf("decrypting blob %v failed: %v", id, err)
@@ -172,22 +191,22 @@ func (r *Repository) loadBlob(ctx context.Context, id restic.ID, t restic.BlobTy
 			continue
 		}
 
-		// move decrypted data to the start of the provided buffer
-		copy(plaintextBuf[0:], plaintext)
-		return len(plaintext), nil
+		// move decrypted data to the start of the buffer
+		copy(buf, plaintext)
+		return buf[:len(plaintext)], nil
 	}
 
 	if lastError != nil {
-		return 0, lastError
+		return nil, lastError
 	}
 
-	return 0, errors.Errorf("loading blob %v from %v packs failed", id.Str(), len(blobs))
+	return nil, errors.Errorf("loading blob %v from %v packs failed", id.Str(), len(blobs))
 }
 
 // LoadJSONUnpacked decrypts the data and afterwards calls json.Unmarshal on
 // the item.
 func (r *Repository) LoadJSONUnpacked(ctx context.Context, t restic.FileType, id restic.ID, item interface{}) (err error) {
-	buf, err := r.LoadAndDecrypt(ctx, t, id)
+	buf, err := r.LoadAndDecrypt(ctx, nil, t, id)
 	if err != nil {
 		return err
 	}
@@ -211,13 +230,10 @@ func (r *Repository) SaveAndEncrypt(ctx context.Context, t restic.BlobType, data
 
 	debug.Log("save id %v (%v, %d bytes)", id, t, len(data))
 
-	// get buf from the pool
-	ciphertext := getBuf()
-
-	ciphertext = ciphertext[:0]
 	nonce := crypto.NewRandomNonce()
+
+	ciphertext := make([]byte, 0, restic.CiphertextLength(len(data)))
 	ciphertext = append(ciphertext, nonce...)
-	defer freeBuf(ciphertext)
 
 	// encrypt blob
 	ciphertext = r.key.Seal(ciphertext, nonce, data, nil)
@@ -391,45 +407,89 @@ const loadIndexParallelism = 4
 func (r *Repository) LoadIndex(ctx context.Context) error {
 	debug.Log("Loading index")
 
-	errCh := make(chan error, 1)
-	indexes := make(chan *Index)
+	// track spawned goroutines using wg, create a new context which is
+	// cancelled as soon as an error occurs.
+	wg, ctx := errgroup.WithContext(ctx)
 
-	worker := func(ctx context.Context, id restic.ID) error {
-		idx, err := LoadIndex(ctx, r, id)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%v, ignoring\n", err)
+	type FileInfo struct {
+		restic.ID
+		Size int64
+	}
+	ch := make(chan FileInfo)
+	indexCh := make(chan *Index)
+
+	// send list of index files through ch, which is closed afterwards
+	wg.Go(func() error {
+		defer close(ch)
+		return r.List(ctx, restic.IndexFile, func(id restic.ID, size int64) error {
+			select {
+			case <-ctx.Done():
+				return nil
+			case ch <- FileInfo{id, size}:
+			}
 			return nil
-		}
+		})
+	})
 
-		select {
-		case indexes <- idx:
-		case <-ctx.Done():
+	// a worker receives an index ID from ch, loads the index, and sends it to indexCh
+	worker := func() error {
+		var buf []byte
+		for fi := range ch {
+			var err error
+			var idx *Index
+			idx, buf, err = LoadIndexWithDecoder(ctx, r, buf[:0], fi.ID, DecodeIndex)
+			if err != nil && errors.Cause(err) == ErrOldIndexFormat {
+				idx, buf, err = LoadIndexWithDecoder(ctx, r, buf[:0], fi.ID, DecodeOldIndex)
+			}
+
+			if err != nil {
+				return errors.Wrap(err, fmt.Sprintf("unable to load index %v", fi.ID.Str()))
+			}
+
+			select {
+			case indexCh <- idx:
+			case <-ctx.Done():
+			}
 		}
 
 		return nil
 	}
 
-	go func() {
-		defer close(indexes)
-		errCh <- FilesInParallel(ctx, r.be, restic.IndexFile, loadIndexParallelism,
-			ParallelWorkFuncParseID(worker))
-	}()
-
-	validIndex := restic.NewIDSet()
-	for idx := range indexes {
-		id, err := idx.ID()
-		if err == nil {
-			validIndex.Insert(id)
-		}
-		r.idx.Insert(idx)
+	// final closes indexCh after all workers have terminated
+	final := func() {
+		close(indexCh)
 	}
 
-	err := r.PrepareCache(validIndex)
+	// run workers on ch
+	wg.Go(func() error {
+		return RunWorkers(ctx, loadIndexParallelism, worker, final)
+	})
+
+	// receive decoded indexes
+	validIndex := restic.NewIDSet()
+	wg.Go(func() error {
+		for idx := range indexCh {
+			id, err := idx.ID()
+			if err == nil {
+				validIndex.Insert(id)
+			}
+			r.idx.Insert(idx)
+		}
+		return nil
+	})
+
+	err := wg.Wait()
+	if err != nil {
+		return errors.Fatal(err.Error())
+	}
+
+	// remove index files from the cache which have been removed in the repo
+	err = r.PrepareCache(validIndex)
 	if err != nil {
 		return err
 	}
 
-	return <-errCh
+	return nil
 }
 
 // PrepareCache initializes the local cache. indexIDs is the list of IDs of
@@ -495,14 +555,15 @@ func (r *Repository) PrepareCache(indexIDs restic.IDSet) error {
 
 // LoadIndex loads the index id from backend and returns it.
 func LoadIndex(ctx context.Context, repo restic.Repository, id restic.ID) (*Index, error) {
-	idx, err := LoadIndexWithDecoder(ctx, repo, id, DecodeIndex)
+	idx, _, err := LoadIndexWithDecoder(ctx, repo, nil, id, DecodeIndex)
 	if err == nil {
 		return idx, nil
 	}
 
 	if errors.Cause(err) == ErrOldIndexFormat {
 		fmt.Fprintf(os.Stderr, "index %v has old format\n", id.Str())
-		return LoadIndexWithDecoder(ctx, repo, id, DecodeOldIndex)
+		idx, _, err := LoadIndexWithDecoder(ctx, repo, nil, id, DecodeOldIndex)
+		return idx, err
 	}
 
 	return nil, err
@@ -609,31 +670,6 @@ func (r *Repository) Close() error {
 	return r.be.Close()
 }
 
-// LoadBlob loads a blob of type t from the repository to the buffer. buf must
-// be large enough to hold the encrypted blob, since it is used as scratch
-// space.
-func (r *Repository) LoadBlob(ctx context.Context, t restic.BlobType, id restic.ID, buf []byte) (int, error) {
-	debug.Log("load blob %v into buf (len %v, cap %v)", id, len(buf), cap(buf))
-	size, found := r.idx.LookupSize(id, t)
-	if !found {
-		return 0, errors.Errorf("id %v not found in repository", id)
-	}
-
-	if cap(buf) < restic.CiphertextLength(int(size)) {
-		return 0, errors.Errorf("buffer is too small for data blob (%d < %d)", cap(buf), restic.CiphertextLength(int(size)))
-	}
-
-	n, err := r.loadBlob(ctx, id, t, buf)
-	if err != nil {
-		return 0, err
-	}
-	buf = buf[:n]
-
-	debug.Log("loaded %d bytes into buf %p", len(buf), buf)
-
-	return len(buf), err
-}
-
 // SaveBlob saves a blob of type t into the repository. If id is the null id, it
 // will be computed and returned.
 func (r *Repository) SaveBlob(ctx context.Context, t restic.BlobType, buf []byte, id restic.ID) (restic.ID, error) {
@@ -648,19 +684,10 @@ func (r *Repository) SaveBlob(ctx context.Context, t restic.BlobType, buf []byte
 func (r *Repository) LoadTree(ctx context.Context, id restic.ID) (*restic.Tree, error) {
 	debug.Log("load tree %v", id)
 
-	size, found := r.idx.LookupSize(id, restic.TreeBlob)
-	if !found {
-		return nil, errors.Errorf("tree %v not found in repository", id)
-	}
-
-	debug.Log("size is %d, create buffer", size)
-	buf := restic.NewBlobBuffer(int(size))
-
-	n, err := r.loadBlob(ctx, id, restic.TreeBlob, buf)
+	buf, err := r.LoadBlob(ctx, restic.TreeBlob, id, nil)
 	if err != nil {
 		return nil, err
 	}
-	buf = buf[:n]
 
 	t := &restic.Tree{}
 	err = json.Unmarshal(buf, t)

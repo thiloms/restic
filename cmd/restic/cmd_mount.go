@@ -1,7 +1,4 @@
-// +build !netbsd
-// +build !openbsd
-// +build !solaris
-// +build !windows
+// +build darwin freebsd linux
 
 package main
 
@@ -44,6 +41,11 @@ You need to specify a sample format for exactly the following timestamp:
 
 For details please see the documentation for time.Format() at:
   https://godoc.org/time#Time.Format
+
+EXIT STATUS
+===========
+
+Exit status is 0 if the command was successful, and non-zero if there was any error.
 `,
 	DisableAutoGenTag: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -54,10 +56,9 @@ For details please see the documentation for time.Format() at:
 // MountOptions collects all options for the mount command.
 type MountOptions struct {
 	OwnerRoot            bool
-	AllowRoot            bool
 	AllowOther           bool
 	NoDefaultPermissions bool
-	Host                 string
+	Hosts                []string
 	Tags                 restic.TagLists
 	Paths                []string
 	SnapshotTemplate     string
@@ -70,11 +71,10 @@ func init() {
 
 	mountFlags := cmdMount.Flags()
 	mountFlags.BoolVar(&mountOptions.OwnerRoot, "owner-root", false, "use 'root' as the owner of files and dirs")
-	mountFlags.BoolVar(&mountOptions.AllowRoot, "allow-root", false, "allow root user to access the data in the mounted directory")
 	mountFlags.BoolVar(&mountOptions.AllowOther, "allow-other", false, "allow other users to access the data in the mounted directory")
 	mountFlags.BoolVar(&mountOptions.NoDefaultPermissions, "no-default-permissions", false, "for 'allow-other', ignore Unix permissions and allow users to read all snapshot files")
 
-	mountFlags.StringVarP(&mountOptions.Host, "host", "H", "", `only consider snapshots for this host`)
+	mountFlags.StringArrayVarP(&mountOptions.Hosts, "host", "H", nil, `only consider snapshots for this host (can be specified multiple times)`)
 	mountFlags.Var(&mountOptions.Tags, "tag", "only consider snapshots which include this `taglist`")
 	mountFlags.StringArrayVar(&mountOptions.Paths, "path", nil, "only consider snapshots which include this (absolute) `path`")
 
@@ -114,10 +114,6 @@ func mount(opts MountOptions, gopts GlobalOptions, mountpoint string) error {
 		systemFuse.FSName("restic"),
 	}
 
-	if opts.AllowRoot {
-		mountOptions = append(mountOptions, systemFuse.AllowRoot())
-	}
-
 	if opts.AllowOther {
 		mountOptions = append(mountOptions, systemFuse.AllowOther())
 
@@ -138,7 +134,7 @@ func mount(opts MountOptions, gopts GlobalOptions, mountpoint string) error {
 
 	cfg := fuse.Config{
 		OwnerIsRoot:      opts.OwnerRoot,
-		Host:             opts.Host,
+		Hosts:            opts.Hosts,
 		Tags:             opts.Tags,
 		Paths:            opts.Paths,
 		SnapshotTemplate: opts.SnapshotTemplate,

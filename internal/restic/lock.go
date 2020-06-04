@@ -221,6 +221,7 @@ func (l *Lock) Stale() bool {
 // timestamp. Afterwards the old lock is removed.
 func (l *Lock) Refresh(ctx context.Context) error {
 	debug.Log("refreshing lock %v", l.lockID)
+	l.Time = time.Now()
 	id, err := l.createLock(ctx)
 	if err != nil {
 		return err
@@ -252,7 +253,7 @@ var ignoreSIGHUP sync.Once
 func init() {
 	ignoreSIGHUP.Do(func() {
 		go func() {
-			c := make(chan os.Signal)
+			c := make(chan os.Signal, 1)
 			signal.Notify(c, syscall.SIGHUP)
 			for s := range c {
 				debug.Log("Signal received: %v\n", s)

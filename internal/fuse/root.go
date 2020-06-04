@@ -1,11 +1,9 @@
-// +build !netbsd
-// +build !openbsd
-// +build !solaris
-// +build !windows
+// +build darwin freebsd linux
 
 package fuse
 
 import (
+	"os"
 	"time"
 
 	"github.com/restic/restic/internal/debug"
@@ -19,7 +17,7 @@ import (
 // Config holds settings for the fuse mount.
 type Config struct {
 	OwnerIsRoot      bool
-	Host             string
+	Hosts            []string
 	Tags             []restic.TagList
 	Paths            []string
 	SnapshotTemplate string
@@ -37,6 +35,8 @@ type Root struct {
 	lastCheck time.Time
 
 	*MetaDir
+
+	uid, gid uint32
 }
 
 // ensure that *Root implements these interfaces
@@ -54,6 +54,11 @@ func NewRoot(ctx context.Context, repo restic.Repository, cfg Config) (*Root, er
 		inode:         rootInode,
 		cfg:           cfg,
 		blobSizeCache: NewBlobSizeCache(ctx, repo.Index()),
+	}
+
+	if !cfg.OwnerIsRoot {
+		root.uid = uint32(os.Getuid())
+		root.gid = uint32(os.Getgid())
 	}
 
 	entries := map[string]fs.Node{

@@ -78,7 +78,8 @@ type Archiver struct {
 	// WithAtime configures if the access time for files and directories should
 	// be saved. Enabling it may result in much metadata, so it's off by
 	// default.
-	WithAtime bool
+	WithAtime   bool
+	IgnoreInode bool
 }
 
 // Options is used to configure the archiver.
@@ -133,6 +134,7 @@ func New(repo restic.Repository, fs fs.FS, opts Options) *Archiver {
 		CompleteItem: func(string, *restic.Node, *restic.Node, ItemStats, time.Duration) {},
 		StartFile:    func(string) {},
 		CompleteBlob: func(string, uint64) {},
+		IgnoreInode:  false,
 	}
 
 	return arch
@@ -179,7 +181,7 @@ func (arch *Archiver) saveTree(ctx context.Context, t *restic.Tree) (restic.ID, 
 	return res.ID(), s, nil
 }
 
-// nodeFromFileInfo returns the restic node from a os.FileInfo.
+// nodeFromFileInfo returns the restic node from an os.FileInfo.
 func (arch *Archiver) nodeFromFileInfo(filename string, fi os.FileInfo) (*restic.Node, error) {
 	node, err := restic.NodeFromFileInfo(filename, fi)
 	if !arch.WithAtime {
@@ -214,10 +216,11 @@ func (arch *Archiver) SaveDir(ctx context.Context, snPath string, fi os.FileInfo
 		return FutureTree{}, err
 	}
 
-	names, err := readdirnames(arch.FS, dir)
+	names, err := readdirnames(arch.FS, dir, fs.O_NOFOLLOW)
 	if err != nil {
 		return FutureTree{}, err
 	}
+	sort.Strings(names)
 
 	nodes := make([]FutureNode, 0, len(names))
 
@@ -375,6 +378,7 @@ func (arch *Archiver) Save(ctx context.Context, snPath, target string, previous 
 		// make sure it's still a file
 		if !fs.IsRegularFile(fi) {
 			err = errors.Errorf("file %v changed type, refusing to archive")
+			_ = file.Close()
 			err = arch.error(abstarget, fi, err)
 			if err != nil {
 				return FutureNode{}, false, err
@@ -382,12 +386,19 @@ func (arch *Archiver) Save(ctx context.Context, snPath, target string, previous 
 			return FutureNode{}, true, nil
 		}
 
-		// use previous node if the file hasn't changed
-		if previous != nil && !fileChanged(fi, previous) {
-			debug.Log("%v hasn't changed, returning old node", target)
+		// use previous list of blobs if the file hasn't changed
+		if previous != nil && !fileChanged(fi, previous, arch.IgnoreInode) {
+			debug.Log("%v hasn't changed, using old list of blobs", target)
 			arch.CompleteItem(snPath, previous, previous, ItemStats{}, time.Since(start))
 			arch.CompleteBlob(snPath, previous.Size)
-			fn.node = previous
+			fn.node, err = arch.nodeFromFileInfo(target, fi)
+			if err != nil {
+				return FutureNode{}, false, err
+			}
+
+			// copy list of blobs
+			fn.node.Content = previous.Content
+
 			_ = file.Close()
 			return fn, false, nil
 		}
@@ -436,7 +447,7 @@ func (arch *Archiver) Save(ctx context.Context, snPath, target string, previous 
 
 // fileChanged returns true if the file's content has changed since the node
 // was created.
-func fileChanged(fi os.FileInfo, node *restic.Node) bool {
+func fileChanged(fi os.FileInfo, node *restic.Node, ignoreInode bool) bool {
 	if node == nil {
 		return true
 	}
@@ -451,14 +462,19 @@ func fileChanged(fi os.FileInfo, node *restic.Node) bool {
 		return true
 	}
 
-	// check size
+	// check status change timestamp
 	extFI := fs.ExtendedStat(fi)
+	if !ignoreInode && !extFI.ChangeTime.Equal(node.ChangeTime) {
+		return true
+	}
+
+	// check size
 	if uint64(fi.Size()) != node.Size || uint64(extFI.Size) != node.Size {
 		return true
 	}
 
 	// check inode
-	if node.Inode != extFI.Inode {
+	if !ignoreInode && node.Inode != extFI.Inode {
 		return true
 	}
 
@@ -500,7 +516,7 @@ func (arch *Archiver) SaveTree(ctx context.Context, snPath string, atree *Tree, 
 	for name := range atree.Nodes {
 		names = append(names, name)
 	}
-	sort.Stable(sort.StringSlice(names))
+	sort.Strings(names)
 
 	for _, name := range names {
 		subatree := atree.Nodes[name]
@@ -613,43 +629,9 @@ func (arch *Archiver) SaveTree(ctx context.Context, snPath string, atree *Tree, 
 	return tree, nil
 }
 
-type fileInfoSlice []os.FileInfo
-
-func (fi fileInfoSlice) Len() int {
-	return len(fi)
-}
-
-func (fi fileInfoSlice) Swap(i, j int) {
-	fi[i], fi[j] = fi[j], fi[i]
-}
-
-func (fi fileInfoSlice) Less(i, j int) bool {
-	return fi[i].Name() < fi[j].Name()
-}
-
-func readdir(filesystem fs.FS, dir string) ([]os.FileInfo, error) {
-	f, err := filesystem.OpenFile(dir, fs.O_RDONLY|fs.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, errors.Wrap(err, "Open")
-	}
-
-	entries, err := f.Readdir(-1)
-	if err != nil {
-		_ = f.Close()
-		return nil, errors.Wrapf(err, "Readdir %v failed", dir)
-	}
-
-	err = f.Close()
-	if err != nil {
-		return nil, err
-	}
-
-	sort.Sort(fileInfoSlice(entries))
-	return entries, nil
-}
-
-func readdirnames(filesystem fs.FS, dir string) ([]string, error) {
-	f, err := filesystem.OpenFile(dir, fs.O_RDONLY|fs.O_NOFOLLOW, 0)
+// flags are passed to fs.OpenFile. O_RDONLY is implied.
+func readdirnames(filesystem fs.FS, dir string, flags int) ([]string, error) {
+	f, err := filesystem.OpenFile(dir, fs.O_RDONLY|flags, 0)
 	if err != nil {
 		return nil, errors.Wrap(err, "Open")
 	}
@@ -665,32 +647,32 @@ func readdirnames(filesystem fs.FS, dir string) ([]string, error) {
 		return nil, err
 	}
 
-	sort.Sort(sort.StringSlice(entries))
 	return entries, nil
 }
 
 // resolveRelativeTargets replaces targets that only contain relative
 // directories ("." or "../../") with the contents of the directory. Each
 // element of target is processed with fs.Clean().
-func resolveRelativeTargets(fs fs.FS, targets []string) ([]string, error) {
+func resolveRelativeTargets(filesys fs.FS, targets []string) ([]string, error) {
 	debug.Log("targets before resolving: %v", targets)
 	result := make([]string, 0, len(targets))
 	for _, target := range targets {
-		target = fs.Clean(target)
-		pc, _ := pathComponents(fs, target, false)
+		target = filesys.Clean(target)
+		pc, _ := pathComponents(filesys, target, false)
 		if len(pc) > 0 {
 			result = append(result, target)
 			continue
 		}
 
 		debug.Log("replacing %q with readdir(%q)", target, target)
-		entries, err := readdirnames(fs, target)
+		entries, err := readdirnames(filesys, target, fs.O_NOFOLLOW)
 		if err != nil {
 			return nil, err
 		}
+		sort.Strings(entries)
 
 		for _, name := range entries {
-			result = append(result, fs.Join(target, name))
+			result = append(result, filesys.Join(target, name))
 		}
 	}
 
@@ -739,7 +721,6 @@ func (arch *Archiver) runWorkers(ctx context.Context, t *tomb.Tomb) {
 	arch.blobSaver = NewBlobSaver(ctx, t, arch.Repo, arch.Options.SaveBlobConcurrency)
 
 	arch.fileSaver = NewFileSaver(ctx, t,
-		arch.FS,
 		arch.blobSaver.Save,
 		arch.Repo.Config().ChunkerPolynomial,
 		arch.Options.FileReadConcurrency, arch.Options.SaveBlobConcurrency)
@@ -808,6 +789,10 @@ func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts Snaps
 	}
 
 	sn, err := restic.NewSnapshot(targets, opts.Tags, opts.Hostname, opts.Time)
+	if err != nil {
+		return nil, restic.ID{}, err
+	}
+
 	sn.Excludes = opts.Excludes
 	if !opts.ParentSnapshot.IsNull() {
 		id := opts.ParentSnapshot

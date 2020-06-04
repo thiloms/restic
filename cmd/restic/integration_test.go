@@ -94,10 +94,10 @@ func testRunRestore(t testing.TB, opts GlobalOptions, dir string, snapshotID res
 	testRunRestoreExcludes(t, opts, dir, snapshotID, nil)
 }
 
-func testRunRestoreLatest(t testing.TB, gopts GlobalOptions, dir string, paths []string, host string) {
+func testRunRestoreLatest(t testing.TB, gopts GlobalOptions, dir string, paths []string, hosts []string) {
 	opts := RestoreOptions{
 		Target: dir,
-		Host:   host,
+		Hosts:  hosts,
 		Paths:  paths,
 	}
 
@@ -217,6 +217,35 @@ func testRunSnapshots(t testing.TB, gopts GlobalOptions) (newest *Snapshot, snap
 func testRunForget(t testing.TB, gopts GlobalOptions, args ...string) {
 	opts := ForgetOptions{}
 	rtest.OK(t, runForget(opts, gopts, args))
+}
+
+func testRunForgetJSON(t testing.TB, gopts GlobalOptions, args ...string) {
+	buf := bytes.NewBuffer(nil)
+	oldJSON := gopts.JSON
+	gopts.stdout = buf
+	gopts.JSON = true
+	defer func() {
+		gopts.stdout = os.Stdout
+		gopts.JSON = oldJSON
+	}()
+
+	opts := ForgetOptions{
+		DryRun: true,
+		Last:   1,
+	}
+
+	rtest.OK(t, runForget(opts, gopts, args))
+
+	var forgets []*ForgetGroup
+	rtest.OK(t, json.Unmarshal(buf.Bytes(), &forgets))
+
+	rtest.Assert(t, len(forgets) == 1,
+		"Expected 1 snapshot group, got %v", len(forgets))
+	rtest.Assert(t, len(forgets[0].Keep) == 1,
+		"Expected 1 snapshot to be kept, got %v", len(forgets[0].Keep))
+	rtest.Assert(t, len(forgets[0].Remove) == 2,
+		"Expected 2 snapshots to be removed, got %v", len(forgets[0].Remove))
+	return
 }
 
 func testRunPrune(t testing.TB, gopts GlobalOptions) {
@@ -736,7 +765,7 @@ func TestRestore(t *testing.T) {
 
 	// Restore latest without any filters
 	restoredir := filepath.Join(env.base, "restore")
-	testRunRestoreLatest(t, env.gopts, restoredir, nil, "")
+	testRunRestoreLatest(t, env.gopts, restoredir, nil, nil)
 
 	rtest.Assert(t, directoriesEqualContents(env.testdata, filepath.Join(restoredir, filepath.Base(env.testdata))),
 		"directories are not equal")
@@ -773,7 +802,7 @@ func TestRestoreLatest(t *testing.T) {
 	testRunCheck(t, env.gopts)
 
 	// Restore latest without any filters
-	testRunRestoreLatest(t, env.gopts, filepath.Join(env.base, "restore0"), nil, "")
+	testRunRestoreLatest(t, env.gopts, filepath.Join(env.base, "restore0"), nil, nil)
 	rtest.OK(t, testFileSize(filepath.Join(env.base, "restore0", "testdata", "testfile.c"), int64(101)))
 
 	// Setup test files in different directories backed up in different snapshots
@@ -794,14 +823,14 @@ func TestRestoreLatest(t *testing.T) {
 	p1rAbs := filepath.Join(env.base, "restore1", "p1/testfile.c")
 	p2rAbs := filepath.Join(env.base, "restore2", "p2/testfile.c")
 
-	testRunRestoreLatest(t, env.gopts, filepath.Join(env.base, "restore1"), []string{filepath.Dir(p1)}, "")
+	testRunRestoreLatest(t, env.gopts, filepath.Join(env.base, "restore1"), []string{filepath.Dir(p1)}, nil)
 	rtest.OK(t, testFileSize(p1rAbs, int64(102)))
 	if _, err := os.Stat(p2rAbs); os.IsNotExist(errors.Cause(err)) {
 		rtest.Assert(t, os.IsNotExist(errors.Cause(err)),
 			"expected %v to not exist in restore, but it exists, err %v", p2rAbs, err)
 	}
 
-	testRunRestoreLatest(t, env.gopts, filepath.Join(env.base, "restore2"), []string{filepath.Dir(p2)}, "")
+	testRunRestoreLatest(t, env.gopts, filepath.Join(env.base, "restore2"), []string{filepath.Dir(p2)}, nil)
 	rtest.OK(t, testFileSize(p2rAbs, int64(103)))
 	if _, err := os.Stat(p1rAbs); os.IsNotExist(errors.Cause(err)) {
 		rtest.Assert(t, os.IsNotExist(errors.Cause(err)),
@@ -1051,6 +1080,7 @@ func TestPrune(t *testing.T) {
 	rtest.Assert(t, len(snapshotIDs) == 3,
 		"expected 3 snapshot, got %v", snapshotIDs)
 
+	testRunForgetJSON(t, env.gopts)
 	testRunForget(t, env.gopts, firstSnapshot[0].String())
 	testRunPrune(t, env.gopts)
 	testRunCheck(t, env.gopts)

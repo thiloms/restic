@@ -18,6 +18,11 @@ var cmdSnapshots = &cobra.Command{
 	Short: "List all snapshots",
 	Long: `
 The "snapshots" command lists all snapshots stored in the repository.
+
+EXIT STATUS
+===========
+
+Exit status is 0 if the command was successful, and non-zero if there was any error.
 `,
 	DisableAutoGenTag: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -27,11 +32,12 @@ The "snapshots" command lists all snapshots stored in the repository.
 
 // SnapshotOptions bundles all options for the snapshots command.
 type SnapshotOptions struct {
-	Host    string
+	Hosts   []string
 	Tags    restic.TagLists
 	Paths   []string
 	Compact bool
 	Last    bool
+	GroupBy string
 }
 
 var snapshotOptions SnapshotOptions
@@ -40,11 +46,12 @@ func init() {
 	cmdRoot.AddCommand(cmdSnapshots)
 
 	f := cmdSnapshots.Flags()
-	f.StringVarP(&snapshotOptions.Host, "host", "H", "", "only consider snapshots for this `host`")
+	f.StringArrayVarP(&snapshotOptions.Hosts, "host", "H", nil, "only consider snapshots for this `host` (can be specified multiple times)")
 	f.Var(&snapshotOptions.Tags, "tag", "only consider snapshots which include this `taglist` (can be specified multiple times)")
 	f.StringArrayVar(&snapshotOptions.Paths, "path", nil, "only consider snapshots for this `path` (can be specified multiple times)")
 	f.BoolVarP(&snapshotOptions.Compact, "compact", "c", false, "use compact format")
 	f.BoolVar(&snapshotOptions.Last, "last", false, "only show the last snapshot for each host and path")
+	f.StringVarP(&snapshotOptions.GroupBy, "group-by", "g", "", "string for grouping snapshots by host,paths,tags")
 }
 
 func runSnapshots(opts SnapshotOptions, gopts GlobalOptions, args []string) error {
@@ -64,25 +71,41 @@ func runSnapshots(opts SnapshotOptions, gopts GlobalOptions, args []string) erro
 	ctx, cancel := context.WithCancel(gopts.ctx)
 	defer cancel()
 
-	var list restic.Snapshots
-	for sn := range FindFilteredSnapshots(ctx, repo, opts.Host, opts.Tags, opts.Paths, args) {
-		list = append(list, sn)
+	var snapshots restic.Snapshots
+	for sn := range FindFilteredSnapshots(ctx, repo, opts.Hosts, opts.Tags, opts.Paths, args) {
+		snapshots = append(snapshots, sn)
+	}
+	snapshotGroups, grouped, err := restic.GroupSnapshots(snapshots, opts.GroupBy)
+	if err != nil {
+		return err
 	}
 
-	if opts.Last {
-		list = FilterLastSnapshots(list)
+	for k, list := range snapshotGroups {
+		if opts.Last {
+			list = FilterLastSnapshots(list)
+		}
+		sort.Sort(sort.Reverse(list))
+		snapshotGroups[k] = list
 	}
-
-	sort.Sort(sort.Reverse(list))
 
 	if gopts.JSON {
-		err := printSnapshotsJSON(gopts.stdout, list)
+		err := printSnapshotGroupJSON(gopts.stdout, snapshotGroups, grouped)
 		if err != nil {
-			Warnf("error printing snapshot: %v\n", err)
+			Warnf("error printing snapshots: %v\n", err)
 		}
 		return nil
 	}
-	PrintSnapshots(gopts.stdout, list, nil, opts.Compact)
+
+	for k, list := range snapshotGroups {
+		if grouped {
+			err := PrintSnapshotGroupHeader(gopts.stdout, k)
+			if err != nil {
+				Warnf("error printing snapshots: %v\n", err)
+				return nil
+			}
+		}
+		PrintSnapshots(gopts.stdout, list, nil, opts.Compact)
+	}
 
 	return nil
 }
@@ -223,6 +246,42 @@ func PrintSnapshots(stdout io.Writer, list restic.Snapshots, reasons []restic.Ke
 	tab.Write(stdout)
 }
 
+// PrintSnapshotGroupHeader prints which group of the group-by option the
+// following snapshots belong to.
+// Prints nothing, if we did not group at all.
+func PrintSnapshotGroupHeader(stdout io.Writer, groupKeyJSON string) error {
+	var key restic.SnapshotGroupKey
+	var err error
+
+	err = json.Unmarshal([]byte(groupKeyJSON), &key)
+	if err != nil {
+		return err
+	}
+
+	if key.Hostname == "" && key.Tags == nil && key.Paths == nil {
+		return nil
+	}
+
+	// Info
+	fmt.Fprintf(stdout, "snapshots")
+	var infoStrings []string
+	if key.Hostname != "" {
+		infoStrings = append(infoStrings, "host ["+key.Hostname+"]")
+	}
+	if key.Tags != nil {
+		infoStrings = append(infoStrings, "tags ["+strings.Join(key.Tags, ", ")+"]")
+	}
+	if key.Paths != nil {
+		infoStrings = append(infoStrings, "paths ["+strings.Join(key.Paths, ", ")+"]")
+	}
+	if infoStrings != nil {
+		fmt.Fprintf(stdout, " for (%s)", strings.Join(infoStrings, ", "))
+	}
+	fmt.Fprintf(stdout, ":\n")
+
+	return nil
+}
+
 // Snapshot helps to print Snaphots as JSON with their ID included.
 type Snapshot struct {
 	*restic.Snapshot
@@ -231,19 +290,58 @@ type Snapshot struct {
 	ShortID string     `json:"short_id"`
 }
 
-// printSnapshotsJSON writes the JSON representation of list to stdout.
-func printSnapshotsJSON(stdout io.Writer, list restic.Snapshots) error {
+// SnapshotGroup helps to print SnaphotGroups as JSON with their GroupReasons included.
+type SnapshotGroup struct {
+	GroupKey  restic.SnapshotGroupKey `json:"group_key"`
+	Snapshots []Snapshot              `json:"snapshots"`
+}
 
+// printSnapshotsJSON writes the JSON representation of list to stdout.
+func printSnapshotGroupJSON(stdout io.Writer, snGroups map[string]restic.Snapshots, grouped bool) error {
+	if grouped {
+		var snapshotGroups []SnapshotGroup
+
+		for k, list := range snGroups {
+			var key restic.SnapshotGroupKey
+			var err error
+			var snapshots []Snapshot
+
+			err = json.Unmarshal([]byte(k), &key)
+			if err != nil {
+				return err
+			}
+
+			for _, sn := range list {
+				k := Snapshot{
+					Snapshot: sn,
+					ID:       sn.ID(),
+					ShortID:  sn.ID().Str(),
+				}
+				snapshots = append(snapshots, k)
+			}
+
+			group := SnapshotGroup{
+				GroupKey:  key,
+				Snapshots: snapshots,
+			}
+			snapshotGroups = append(snapshotGroups, group)
+		}
+
+		return json.NewEncoder(stdout).Encode(snapshotGroups)
+	}
+
+	// Old behavior
 	var snapshots []Snapshot
 
-	for _, sn := range list {
-
-		k := Snapshot{
-			Snapshot: sn,
-			ID:       sn.ID(),
-			ShortID:  sn.ID().Str(),
+	for _, list := range snGroups {
+		for _, sn := range list {
+			k := Snapshot{
+				Snapshot: sn,
+				ID:       sn.ID(),
+				ShortID:  sn.ID().Str(),
+			}
+			snapshots = append(snapshots, k)
 		}
-		snapshots = append(snapshots, k)
 	}
 
 	return json.NewEncoder(stdout).Encode(snapshots)

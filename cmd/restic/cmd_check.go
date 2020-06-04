@@ -25,6 +25,11 @@ finds. It can also be used to read all data and therefore simulate a restore.
 
 By default, the "check" command will always load all data directly from the
 repository and not use a local cache.
+
+EXIT STATUS
+===========
+
+Exit status is 0 if the command was successful, and non-zero if there was any error.
 `,
 	DisableAutoGenTag: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -67,10 +72,16 @@ func checkFlags(opts CheckOptions) error {
 		if dataSubset[0] == 0 || dataSubset[1] == 0 || dataSubset[0] > dataSubset[1] {
 			return errors.Fatalf("check flag --read-data-subset=n/t values must be positive integers, and n <= t, e.g. --read-data-subset=1/2")
 		}
+		if dataSubset[1] > totalBucketsMax {
+			return errors.Fatalf("check flag --read-data-subset=n/t t must be at most %d", totalBucketsMax)
+		}
 	}
 
 	return nil
 }
+
+// See doReadData in runCheck below for why this is 256.
+const totalBucketsMax = 256
 
 // stringToIntSlice converts string to []uint, using '/' as element separator
 func stringToIntSlice(param string) (split []uint, err error) {
@@ -257,6 +268,8 @@ func runCheck(opts CheckOptions, gopts GlobalOptions, args []string) error {
 	doReadData := func(bucket, totalBuckets uint) {
 		packs := restic.IDSet{}
 		for pack := range chkr.GetPacks() {
+			// If we ever check more than the first byte
+			// of pack, update totalBucketsMax.
 			if (uint(pack[0]) % totalBuckets) == (bucket - 1) {
 				packs.Insert(pack)
 			}

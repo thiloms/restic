@@ -48,10 +48,6 @@ installed from the official repos, e.g. with ``apt-get``:
     $ apt-get install restic
 
 
-.. warning:: Please be aware that, at the time of writing, Debian *stable*
-   has ``restic`` version 0.3.3 which is very old. The *testing* and *unstable*
-   branches have recent versions of ``restic``.
-
 Fedora
 ======
 
@@ -112,6 +108,15 @@ On FreeBSD (11 and probably later versions), you can install restic using ``pkg 
 .. code-block:: console
 
     # pkg install restic
+
+openSUSE
+========
+
+On openSUSE (leap 15.0 and greater, and tumbleweed), you can install restic using the ``zypper`` package manager:
+
+.. code-block:: console
+
+    # zypper install restic
 
 RHEL & CentOS
 =============
@@ -174,28 +179,28 @@ There's both pre-compiled binaries for different platforms as well as the source
 code available for download. Just download and run the one matching your system.
 
 The official binaries can be updated in place using the ``restic self-update``
-command:
+command (needs restic 0.9.3 or later):
 
 .. code-block:: console
 
     $ restic version
-    restic 0.9.1 compiled with go1.10.3 on linux/amd64
+    restic 0.9.3 compiled with go1.11.2 on linux/amd64
 
     $ restic self-update
     find latest release of restic at GitHub
-    latest version is 0.9.2
+    latest version is 0.9.4
     download file SHA256SUMS
     download SHA256SUMS
     download file SHA256SUMS
     download SHA256SUMS.asc
     GPG signature verification succeeded
-    download restic_0.9.2_linux_amd64.bz2
-    downloaded restic_0.9.2_linux_amd64.bz2
+    download restic_0.9.4_linux_amd64.bz2
+    downloaded restic_0.9.4_linux_amd64.bz2
     saved 12115904 bytes in ./restic
-    successfully updated restic to version 0.9.2
+    successfully updated restic to version 0.9.4
 
     $ restic version
-    restic 0.9.2 compiled with go1.10.3 on linux/amd64
+    restic 0.9.4 compiled with go1.12.1 on linux/amd64
 
 The ``self-update`` command uses the GPG signature on the files uploaded to
 GitHub to verify their authenticity. No external programs are necessary.
@@ -240,7 +245,7 @@ From Source
 ***********
 
 restic is written in the Go programming language and you need at least
-Go version 1.9. Building restic may also work with older versions of Go,
+Go version 1.11. Building restic may also work with older versions of Go,
 but that's not supported. See the `Getting
 started <https://golang.org/doc/install>`__ guide of the Go project for
 instructions how to install Go.
@@ -254,13 +259,6 @@ In order to build restic from source, execute the following steps:
 
     $ cd restic
 
-    $ go run -mod=vendor build.go
-
-For Go versions < 1.11, the option ``-mod=vendor`` needs to be removed, like
-this:
-
-.. code-block:: console
-
     $ go run build.go
 
 You can easily cross-compile restic for all supported platforms, just
@@ -269,13 +267,11 @@ supply the target OS and platform via the command-line options like this
 
 .. code-block:: console
 
-    $ go run -mod=vendor build.go --goos windows --goarch amd64
+    $ go run build.go --goos windows --goarch amd64
 
-    $ go run -mod=vendor build.go --goos freebsd --goarch 386
+    $ go run build.go --goos freebsd --goarch 386
 
-    $ go run -mod=vendor build.go --goos linux --goarch arm --goarm 6
-
-Again, for Go < 1.11 ``-mod=vendor`` needs to be removed.
+    $ go run build.go --goos linux --goarch arm --goarm 6
 
 The resulting binary is statically linked and does not require any
 libraries.
@@ -292,7 +288,7 @@ Restic can write out man pages and bash/zsh compatible autocompletion scripts:
 
     $ ./restic generate --help
 
-    The "generate" command writes automatically generated files like the man pages
+    The "generate" command writes automatically generated files (like the man pages
     and the auto-completion files for bash and zsh).
 
     Usage:
