@@ -3,17 +3,15 @@ package archiver
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/restic/restic/internal/fs"
 	"github.com/restic/restic/internal/repository"
-	restictest "github.com/restic/restic/internal/test"
+	rtest "github.com/restic/restic/internal/test"
 )
 
 // MockT passes through all logging functions from T, but catches Fail(),
@@ -56,23 +54,19 @@ func (t *MockT) Errorf(msg string, args ...interface{}) {
 func createFilesAt(t testing.TB, targetdir string, files map[string]interface{}) {
 	for name, item := range files {
 		target := filepath.Join(targetdir, filepath.FromSlash(name))
-		err := fs.MkdirAll(filepath.Dir(target), 0700)
+		err := os.MkdirAll(filepath.Dir(target), 0700)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		switch it := item.(type) {
 		case TestFile:
-			err := ioutil.WriteFile(target, []byte(it.Content), 0600)
+			err := os.WriteFile(target, []byte(it.Content), 0600)
 			if err != nil {
 				t.Fatal(err)
 			}
 		case TestSymlink:
-			// ignore symlinks on windows
-			if runtime.GOOS == "windows" {
-				continue
-			}
-			err := fs.Symlink(filepath.FromSlash(it.Target), target)
+			err := os.Symlink(filepath.FromSlash(it.Target), target)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -93,7 +87,7 @@ func TestTestCreateFiles(t *testing.T) {
 				},
 				"sub": TestDir{
 					"subsub": TestDir{
-						"link": TestSymlink{Target: "x/y/z"},
+						"link": TestSymlink{Target: filepath.Clean("x/y/z")},
 					},
 				},
 			},
@@ -101,18 +95,17 @@ func TestTestCreateFiles(t *testing.T) {
 				"foo":             TestFile{Content: "foo"},
 				"subdir":          TestDir{},
 				"subdir/subfile":  TestFile{Content: "bar"},
-				"sub/subsub/link": TestSymlink{Target: "x/y/z"},
+				"sub/subsub/link": TestSymlink{Target: filepath.Clean("x/y/z")},
 			},
 		},
 	}
 
 	for i, test := range tests {
-		tempdir, cleanup := restictest.TempDir(t)
-		defer cleanup()
+		tempdir := rtest.TempDir(t)
 
 		t.Run("", func(t *testing.T) {
 			tempdir := filepath.Join(tempdir, fmt.Sprintf("test-%d", i))
-			err := fs.MkdirAll(tempdir, 0700)
+			err := os.MkdirAll(tempdir, 0700)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -120,16 +113,8 @@ func TestTestCreateFiles(t *testing.T) {
 			TestCreateFiles(t, tempdir, test.dir)
 
 			for name, item := range test.files {
-				// don't check symlinks on windows
-				if runtime.GOOS == "windows" {
-					if _, ok := item.(TestSymlink); ok {
-						continue
-					}
-					continue
-				}
-
 				targetPath := filepath.Join(tempdir, filepath.FromSlash(name))
-				fi, err := fs.Lstat(targetPath)
+				fi, err := os.Lstat(targetPath)
 				if err != nil {
 					t.Error(err)
 					continue
@@ -137,12 +122,12 @@ func TestTestCreateFiles(t *testing.T) {
 
 				switch node := item.(type) {
 				case TestFile:
-					if !fs.IsRegularFile(fi) {
+					if !fi.Mode().IsRegular() {
 						t.Errorf("is not regular file: %v", name)
 						continue
 					}
 
-					content, err := ioutil.ReadFile(targetPath)
+					content, err := os.ReadFile(targetPath)
 					if err != nil {
 						t.Error(err)
 						continue
@@ -157,7 +142,7 @@ func TestTestCreateFiles(t *testing.T) {
 						continue
 					}
 
-					target, err := fs.Readlink(targetPath)
+					target, err := os.Readlink(targetPath)
 					if err != nil {
 						t.Error(err)
 						continue
@@ -206,8 +191,7 @@ func TestTestWalkFiles(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run("", func(t *testing.T) {
-			tempdir, cleanup := restictest.TempDir(t)
-			defer cleanup()
+			tempdir := rtest.TempDir(t)
 
 			got := make(map[string]string)
 
@@ -218,7 +202,7 @@ func TestTestWalkFiles(t *testing.T) {
 					return err
 				}
 
-				got[p] = fmt.Sprintf("%v", item)
+				got[p] = fmt.Sprint(item)
 				return nil
 			})
 
@@ -234,13 +218,12 @@ func TestTestEnsureFiles(t *testing.T) {
 		expectFailure bool
 		files         map[string]interface{}
 		want          TestDir
-		unixOnly      bool
 	}{
 		{
 			files: map[string]interface{}{
 				"foo":            TestFile{Content: "foo"},
 				"subdir/subfile": TestFile{Content: "bar"},
-				"x/y/link":       TestSymlink{Target: "../../foo"},
+				"x/y/link":       TestSymlink{Target: filepath.Clean("../../foo")},
 			},
 			want: TestDir{
 				"foo": TestFile{Content: "foo"},
@@ -249,7 +232,7 @@ func TestTestEnsureFiles(t *testing.T) {
 				},
 				"x": TestDir{
 					"y": TestDir{
-						"link": TestSymlink{Target: "../../foo"},
+						"link": TestSymlink{Target: filepath.Clean("../../foo")},
 					},
 				},
 			},
@@ -296,7 +279,6 @@ func TestTestEnsureFiles(t *testing.T) {
 		},
 		{
 			expectFailure: true,
-			unixOnly:      true,
 			files: map[string]interface{}{
 				"foo": TestFile{Content: "foo"},
 			},
@@ -306,7 +288,6 @@ func TestTestEnsureFiles(t *testing.T) {
 		},
 		{
 			expectFailure: true,
-			unixOnly:      true,
 			files: map[string]interface{}{
 				"foo": TestSymlink{Target: "xxx"},
 			},
@@ -340,14 +321,7 @@ func TestTestEnsureFiles(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run("", func(t *testing.T) {
-			if test.unixOnly && runtime.GOOS == "windows" {
-				t.Skip("skip on Windows")
-				return
-			}
-
-			tempdir, cleanup := restictest.TempDir(t)
-			defer cleanup()
-
+			tempdir := rtest.TempDir(t)
 			createFilesAt(t, tempdir, test.files)
 
 			subtestT := testing.TB(t)
@@ -369,7 +343,6 @@ func TestTestEnsureSnapshot(t *testing.T) {
 		expectFailure bool
 		files         map[string]interface{}
 		want          TestDir
-		unixOnly      bool
 	}{
 		{
 			files: map[string]interface{}{
@@ -452,7 +425,6 @@ func TestTestEnsureSnapshot(t *testing.T) {
 		},
 		{
 			expectFailure: true,
-			unixOnly:      true,
 			files: map[string]interface{}{
 				"foo": TestSymlink{Target: filepath.FromSlash("x/y/z")},
 			},
@@ -477,30 +449,23 @@ func TestTestEnsureSnapshot(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run("", func(t *testing.T) {
-			if test.unixOnly && runtime.GOOS == "windows" {
-				t.Skip("skip on Windows")
-				return
-			}
-
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
-			tempdir, cleanup := restictest.TempDir(t)
-			defer cleanup()
+			tempdir := rtest.TempDir(t)
 
 			targetDir := filepath.Join(tempdir, "target")
-			err := fs.Mkdir(targetDir, 0700)
+			err := os.Mkdir(targetDir, 0700)
 			if err != nil {
 				t.Fatal(err)
 			}
 
 			createFilesAt(t, targetDir, test.files)
 
-			back := fs.TestChdir(t, tempdir)
+			back := rtest.Chdir(t, tempdir)
 			defer back()
 
-			repo, cleanup := repository.TestRepository(t)
-			defer cleanup()
+			repo := repository.TestRepository(t)
 
 			arch := New(repo, fs.Local{}, Options{})
 			opts := SnapshotOptions{
@@ -508,7 +473,7 @@ func TestTestEnsureSnapshot(t *testing.T) {
 				Hostname: "localhost",
 				Tags:     []string{"test"},
 			}
-			_, id, err := arch.Snapshot(ctx, []string{"."}, opts)
+			_, id, _, err := arch.Snapshot(ctx, []string{"."}, opts)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -2,6 +2,7 @@ package rclone
 
 import (
 	"strings"
+	"time"
 
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/options"
@@ -10,15 +11,17 @@ import (
 // Config contains all configuration necessary to start rclone.
 type Config struct {
 	Program     string `option:"program" help:"path to rclone (default: rclone)"`
-	Args        string `option:"args"    help:"arguments for running rclone (default: serve restic --stdio --b2-hard-delete --drive-use-trash=false)"`
+	Args        string `option:"args"    help:"arguments for running rclone (default: serve restic --stdio --b2-hard-delete)"`
 	Remote      string
-	Connections uint `option:"connections" help:"set a limit for the number of concurrent connections (default: 5)"`
+	Connections uint          `option:"connections" help:"set a limit for the number of concurrent connections (default: 5)"`
+	Timeout     time.Duration `option:"timeout"     help:"set a timeout limit to wait for rclone to establish a connection (default: 1m)"`
 }
 
 var defaultConfig = Config{
 	Program:     "rclone",
-	Args:        "serve restic --stdio --b2-hard-delete --drive-use-trash=false",
+	Args:        "serve restic --stdio --b2-hard-delete",
 	Connections: 5,
+	Timeout:     time.Minute,
 }
 
 func init() {
@@ -31,7 +34,7 @@ func NewConfig() Config {
 }
 
 // ParseConfig parses the string s and extracts the remote server URL.
-func ParseConfig(s string) (interface{}, error) {
+func ParseConfig(s string) (*Config, error) {
 	if !strings.HasPrefix(s, "rclone:") {
 		return nil, errors.New("invalid rclone backend specification")
 	}
@@ -39,5 +42,5 @@ func ParseConfig(s string) (interface{}, error) {
 	s = s[7:]
 	cfg := NewConfig()
 	cfg.Remote = s
-	return cfg, nil
+	return &cfg, nil
 }

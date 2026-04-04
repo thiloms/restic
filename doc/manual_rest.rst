@@ -8,9 +8,12 @@ Usage help is available:
 
 .. code-block:: console
 
-    $ ./restic --help
+    $ restic --help
+
     restic is a backup program which allows saving multiple revisions of files and
     directories in an encrypted repository stored on different backends.
+
+    The full documentation can be found at https://restic.readthedocs.io/ .
 
     Usage:
       restic [command]
@@ -20,12 +23,11 @@ Usage help is available:
       cache         Operate on local cache directories
       cat           Print internal objects to stdout
       check         Check the repository for errors
+      copy          Copy snapshots from one repository to another
       diff          Show differences between two snapshots
       dump          Print a backed-up file to stdout
       find          Find a file, a directory or restic IDs
       forget        Remove snapshots from the repository
-      generate      Generate manual pages and auto-completion files (bash, zsh)
-      help          Help about any command
       init          Initialize a new repository
       key           Manage keys (passwords)
       list          List objects in the repository
@@ -33,34 +35,51 @@ Usage help is available:
       migrate       Apply migrations
       mount         Mount the repository
       prune         Remove unneeded data from the repository
-      rebuild-index Build a new index file
-      recover       Recover data from the repository
+      recover       Recover data from the repository not referenced by snapshots
+      repair        Repair the repository
       restore       Extract the data from a snapshot
-      self-update   Update the restic binary
+      rewrite       Rewrite snapshots to exclude unwanted files
       snapshots     List all snapshots
       stats         Scan the repository and show basic statistics
       tag           Modify tags on snapshots
       unlock        Remove locks other processes created
+
+    Advanced Options:
+      features      Print list of feature flags
+      options       Print list of extended options
+
+    Additional Commands:
+      generate      Generate manual pages and auto-completion files (bash, fish, zsh, powershell)
+      help          Help about any command
+      self-update   Update the restic binary
       version       Print version information
 
     Flags:
-          --cacert file                file to load root certificates from (default: use system certificates)
+          --cacert file                file to load root certificates from (default: use system certificates or $RESTIC_CACERT)
           --cache-dir directory        set the cache directory. (default: use system default cache directory)
           --cleanup-cache              auto remove old cache directories
+          --compression mode           compression mode (only available for repository format version 2), one of (auto|off|max) (default: $RESTIC_COMPRESSION) (default auto)
       -h, --help                       help for restic
+          --http-user-agent string     set a http user agent for outgoing http requests
+          --insecure-no-password       use an empty password for the repository, must be passed to every restic command (insecure)
+          --insecure-tls               skip TLS certificate verification when connecting to the repository (insecure)
           --json                       set output mode to JSON for commands that support it
           --key-hint key               key ID of key to try decrypting first (default: $RESTIC_KEY_HINT)
-          --limit-download int         limits downloads to a maximum rate in KiB/s. (default: unlimited)
-          --limit-upload int           limits uploads to a maximum rate in KiB/s. (default: unlimited)
+          --limit-download rate        limits downloads to a maximum rate in KiB/s. (default: unlimited)
+          --limit-upload rate          limits uploads to a maximum rate in KiB/s. (default: unlimited)
           --no-cache                   do not use a local cache
-          --no-lock                    do not lock the repo, this allows some operations on read-only repos
+          --no-extra-verify            skip additional verification of data before upload (see documentation)
+          --no-lock                    do not lock the repository, this allows some operations on read-only repositories
       -o, --option key=value           set extended option (key=value, can be specified multiple times)
-          --password-command command   specify a shell command to obtain a password (default: $RESTIC_PASSWORD_COMMAND)
-      -p, --password-file file         read the repository password from a file (default: $RESTIC_PASSWORD_FILE)
+          --pack-size size             set target pack size in MiB, created pack files may be larger (default: $RESTIC_PACK_SIZE)
+          --password-command command   shell command to obtain the repository password from (default: $RESTIC_PASSWORD_COMMAND)
+      -p, --password-file file         file to read the repository password from (default: $RESTIC_PASSWORD_FILE)
       -q, --quiet                      do not output comprehensive progress report
       -r, --repo repository            repository to backup to or restore from (default: $RESTIC_REPOSITORY)
-          --tls-client-cert file       path to a file containing PEM encoded TLS client certificate and private key
-      -v, --verbose n                  be verbose (specify --verbose multiple times or level n)
+          --repository-file file       file to read the repository location from (default: $RESTIC_REPOSITORY_FILE)
+          --retry-lock duration        retry to lock the repository if it is already locked, takes a value like 5m or 2h (default: no retries)
+          --tls-client-cert file       path to a file containing PEM encoded TLS client certificate and private key (default: $RESTIC_TLS_CLIENT_CERT)
+      -v, --verbose                    be verbose (specify multiple times or a level using --verbose=n, max level/times is 2)
 
     Use "restic [command] --help" for more information about a command.
 
@@ -72,69 +91,92 @@ command:
 
 .. code-block:: console
 
-    $ ./restic backup --help
+    $ restic backup --help
+
     The "backup" command creates a new snapshot and saves the files and directories
     given as the arguments.
 
     EXIT STATUS
     ===========
 
-    Exit status is 0 if the command was successful, and non-zero if there was any error.
-
-    Note that some issues such as unreadable or deleted files during backup
-    currently doesn't result in a non-zero error exit status.
+    Exit status is 0 if the command was successful.
+    Exit status is 1 if there was a fatal error (no snapshot created).
+    Exit status is 3 if some source data could not be read (incomplete snapshot created).
 
     Usage:
-      restic backup [flags] FILE/DIR [FILE/DIR] ...
+      restic backup [flags] [FILE/DIR] ...
 
     Flags:
+      -n, --dry-run                                do not upload or write any data, just show what would be done
       -e, --exclude pattern                        exclude a pattern (can be specified multiple times)
-          --exclude-caches                         excludes cache directories that are marked with a CACHEDIR.TAG file. See http://bford.info/cachedir/spec.html for the Cache Directory Tagging Standard
+          --exclude-caches                         excludes cache directories that are marked with a CACHEDIR.TAG file. See https://bford.info/cachedir/ for the Cache Directory Tagging Standard
           --exclude-file file                      read exclude patterns from a file (can be specified multiple times)
           --exclude-if-present filename[:header]   takes filename[:header], exclude contents of directories containing filename (except filename itself) if header of that file is as provided (can be specified multiple times)
-          --files-from file                        read the files to backup from file (can be combined with file args/can be specified multiple times)
-      -f, --force                                  force re-reading the target files/directories (overrides the "parent" flag)
+          --exclude-larger-than size               max size of the files to be backed up (allowed suffixes: k/K, m/M, g/G, t/T)
+          --files-from file                        read the files to backup from file (can be combined with file args; can be specified multiple times)
+          --files-from-raw file                    read the files to backup from file (can be combined with file args; can be specified multiple times)
+          --files-from-verbatim file               read the files to backup from file (can be combined with file args; can be specified multiple times)
+      -f, --force                                  force re-reading the source files/directories (overrides the "parent" flag)
+      -g, --group-by group                         group snapshots by host, paths and/or tags, separated by comma (disable grouping with '') (default host,paths)
       -h, --help                                   help for backup
-      -H, --host hostname                          set the hostname for the snapshot manually. To prevent an expensive rescan use the "parent" flag
+      -H, --host hostname                          set the hostname for the snapshot manually (default: $RESTIC_HOST). To prevent an expensive rescan use the "parent" flag
           --iexclude pattern                       same as --exclude pattern but ignores the casing of filenames
-          --ignore-inode                           ignore inode number changes when checking for modified files
-      -x, --one-file-system                        exclude other file systems
-          --parent snapshot                        use this parent snapshot (default: last snapshot in the repo that has the same target files/directories)
+          --iexclude-file file                     same as --exclude-file but ignores casing of filenames in patterns
+          --ignore-ctime                           ignore ctime changes when checking for modified files
+          --ignore-inode                           ignore inode number and ctime changes when checking for modified files
+          --no-scan                                do not run scanner to estimate size of backup
+      -x, --one-file-system                        exclude other file systems, don't cross filesystem boundaries and subvolumes
+          --parent snapshot                        use this parent snapshot (default: latest snapshot in the group determined by --group-by and not newer than the timestamp determined by --time)
+          --read-concurrency n                     read n files concurrently (default: $RESTIC_READ_CONCURRENCY or 2)
+          --skip-if-unchanged                      skip snapshot creation if identical to parent snapshot
           --stdin                                  read backup from stdin
           --stdin-filename filename                filename to use when reading from stdin (default "stdin")
-          --tag tag                                add a tag for the new snapshot (can be specified multiple times)
+          --stdin-from-command                     interpret arguments as command to execute and store its stdout
+          --tag tags                               add tags for the new snapshot in the format `tag[,tag,...]` (can be specified multiple times) (default [])
           --time time                              time of the backup (ex. '2012-11-01 22:08:41') (default: now)
+          --use-fs-snapshot                        use filesystem snapshot where possible (currently only Windows VSS)
           --with-atime                             store the atime for all files and directories
 
     Global Flags:
-          --cacert file                file to load root certificates from (default: use system certificates)
+          --cacert file                file to load root certificates from (default: use system certificates or $RESTIC_CACERT)
           --cache-dir directory        set the cache directory. (default: use system default cache directory)
           --cleanup-cache              auto remove old cache directories
+          --compression mode           compression mode (only available for repository format version 2), one of (auto|off|max) (default: $RESTIC_COMPRESSION) (default auto)
+          --http-user-agent string     set a http user agent for outgoing http requests
+          --insecure-no-password       use an empty password for the repository, must be passed to every restic command (insecure)
+          --insecure-tls               skip TLS certificate verification when connecting to the repository (insecure)
           --json                       set output mode to JSON for commands that support it
           --key-hint key               key ID of key to try decrypting first (default: $RESTIC_KEY_HINT)
-          --limit-download int         limits downloads to a maximum rate in KiB/s. (default: unlimited)
-          --limit-upload int           limits uploads to a maximum rate in KiB/s. (default: unlimited)
+          --limit-download rate        limits downloads to a maximum rate in KiB/s. (default: unlimited)
+          --limit-upload rate          limits uploads to a maximum rate in KiB/s. (default: unlimited)
           --no-cache                   do not use a local cache
-          --no-lock                    do not lock the repo, this allows some operations on read-only repos
+          --no-extra-verify            skip additional verification of data before upload (see documentation)
+          --no-lock                    do not lock the repository, this allows some operations on read-only repositories
       -o, --option key=value           set extended option (key=value, can be specified multiple times)
-          --password-command command   specify a shell command to obtain a password (default: $RESTIC_PASSWORD_COMMAND)
-      -p, --password-file file         read the repository password from a file (default: $RESTIC_PASSWORD_FILE)
+          --pack-size size             set target pack size in MiB, created pack files may be larger (default: $RESTIC_PACK_SIZE)
+          --password-command command   shell command to obtain the repository password from (default: $RESTIC_PASSWORD_COMMAND)
+      -p, --password-file file         file to read the repository password from (default: $RESTIC_PASSWORD_FILE)
       -q, --quiet                      do not output comprehensive progress report
       -r, --repo repository            repository to backup to or restore from (default: $RESTIC_REPOSITORY)
-          --tls-client-cert file       path to a file containing PEM encoded TLS client certificate and private key
-      -v, --verbose n                  be verbose (specify --verbose multiple times or level n)
+          --repository-file file       file to read the repository location from (default: $RESTIC_REPOSITORY_FILE)
+          --retry-lock duration        retry to lock the repository if it is already locked, takes a value like 5m or 2h (default: no retries)
+          --tls-client-cert file       path to a file containing PEM encoded TLS client certificate and private key (default: $RESTIC_TLS_CLIENT_CERT)
+      -v, --verbose                    be verbose (specify multiple times or a level using --verbose=n, max level/times is 2)
 
-Subcommand that support showing progress information such as ``backup``,
-``check`` and ``prune`` will do so unless the quiet flag ``-q`` or
-``--quiet`` is set. When running from a non-interactive console progress
-reporting will be limited to once every 10 seconds to not fill your
-logs. Use ``backup`` with the quiet flag ``-q`` or ``--quiet`` to skip
-the initial scan of the source directory, this may shorten the backup
-time needed for large directories.
+Subcommands that support showing progress information such as ``backup``,
+``restore``, ``check`` and ``prune`` will do so unless the quiet flag ``-q``
+or ``--quiet`` is set. When running from a non-interactive console progress
+reporting is disabled by default to not fill your logs. For interactive and
+non-interactive consoles the environment variable ``RESTIC_PROGRESS_FPS`` can
+be used to control the frequency of progress reporting. Use for example
+``0.016666`` to only update the progress once per minute.
 
-Additionally on Unix systems if ``restic`` receives a SIGUSR1 signal the
+Additionally, on Unix systems if ``restic`` receives a SIGUSR1 signal the
 current progress will be written to the standard output so you can check up
 on the status at will.
+
+Setting the `RESTIC_PROGRESS_FPS` environment variable or sending a `SIGUSR1`
+signal prints a status report even when `--quiet` was specified.
 
 Manage tags
 -----------
@@ -153,12 +195,10 @@ command does that:
     create exclusive lock for repository
     modified tags on 1 snapshots
 
-Note the snapshot ID has changed, so between each change we need to look
-up the new ID of the snapshot. But there is an even better way, the
-``tag`` command accepts ``--tag`` for a filter, so we can filter
-snapshots based on the tag we just added.
-
-So we can add and remove tags incrementally like this:
+Note the snapshot ID has changed, so between each change we need to look up the
+new ID of the snapshot. But there is an even better way - the ``tag`` command
+accepts a filter using the ``--tag`` option, so we can filter snapshots based
+on the tag we just added. This way we can add and remove tags incrementally:
 
 .. code-block:: console
 
@@ -176,6 +216,14 @@ So we can add and remove tags incrementally like this:
 
     $ restic -r /srv/restic-repo tag --tag NL --add SOMETHING
     no snapshots were modified
+
+To operate on untagged snapshots only, specify the empty string ``''`` as the
+filter value to ``--tag``. The following command will add the tag ``OTHER``
+to all untagged snapshots:
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo tag --tag '' --add OTHER
 
 Under the hood
 --------------
@@ -195,7 +243,7 @@ locks with the following command:
     d369ccc7d126594950bf74f0a348d5d98d9e99f3215082eb69bf02dc9b3e464c
 
 The ``find`` command searches for a given
-`pattern <https://golang.org/pkg/path/filepath/#Match>`__ in the
+`pattern <https://pkg.go.dev/path/filepath#Match>`__ in the
 repository.
 
 .. code-block:: console
@@ -230,7 +278,10 @@ Metadata handling
 ~~~~~~~~~~~~~~~~~
 
 Restic saves and restores most default attributes, including extended attributes like ACLs.
-Sparse files are not handled in a special way yet, and aren't restored.
+Information about holes in a sparse file is not stored explicitly, that is during a backup
+the zero bytes in a hole are deduplicated and compressed like any other data backed up.
+Instead, the restore command optionally creates holes in files by detecting and replacing
+long runs of zeros, in filesystems that support sparse files.
 
 The following metadata is handled by restic:
 
@@ -287,7 +338,6 @@ required to restore the latest snapshot (from any host that made it):
 .. code-block:: console
 
     $ restic stats latest
-    password is correct
     Total File Count:   10538
           Total Size:   37.824 GiB
 
@@ -298,12 +348,15 @@ host by using the ``--host`` flag:
 .. code-block:: console
 
     $ restic stats --host myserver latest
-    password is correct
     Total File Count:   21766
           Total Size:   481.783 GiB
 
 There we see that it would take 482 GiB of disk space to restore the latest
 snapshot from "myserver".
+
+In case you have multiple backups running from the same host so can also use
+``--tag`` and ``--path`` to be more specific about which snapshots you
+are looking for.
 
 But how much space does that snapshot take on disk? In other words, how much
 has restic's deduplication helped? We can check:
@@ -311,7 +364,6 @@ has restic's deduplication helped? We can check:
 .. code-block:: console
 
     $ restic stats --host myserver --mode raw-data latest
-    password is correct
     Total Blob Count:   340847
           Total Size:   458.663 GiB
 
@@ -361,15 +413,19 @@ lists all snapshots as JSON and uses ``jq`` to pretty-print the result:
       }
     ]
 
+.. _temporary_files:
+
 Temporary files
 ---------------
 
 During some operations (e.g. ``backup`` and ``prune``) restic uses
 temporary files to store data. These files will, by default, be saved to
 the system's temporary directory, on Linux this is usually located in
-``/tmp/``. The environment variable ``TMPDIR`` can be used to specify a
-different directory, e.g. to use the directory ``/var/tmp/restic-tmp``
-instead of the default, set the environment variable like this:
+``/tmp/``. To specify a different directory for temporary files, set
+the appropriate environment variable. On non-Windows operating systems,
+use the ``TMPDIR`` environment variable. On Windows, use the ``TMP``
+environment variable. For example, to use the directory ``/var/tmp/restic-tmp``
+instead of the default, set the environment variable as follows:
 
 .. code-block:: console
 
@@ -377,6 +433,7 @@ instead of the default, set the environment variable like this:
     $ restic -r /srv/restic-repo backup ~/work
 
 
+.. _caching:
 
 Caching
 -------
@@ -386,20 +443,28 @@ This allows faster operations, since meta data does not need to be loaded from
 a remote repository. The cache is automatically created, usually in an
 OS-specific cache folder:
 
- * Linux/other: ``~/.cache/restic`` (or ``$XDG_CACHE_HOME/restic``)
- * macOS: ``~/Library/Caches/restic``
- * Windows: ``%LOCALAPPDATA%/restic``
+* Linux/other: ``$XDG_CACHE_HOME/restic``, or ``~/.cache/restic`` if
+  ``XDG_CACHE_HOME`` is not set
+* macOS: ``~/Library/Caches/restic``
+* Windows: ``%LOCALAPPDATA%/restic``
+
+If the relevant environment variables are not set, restic exits with an error
+message.
 
 The command line parameter ``--cache-dir`` or the environment variable
 ``$RESTIC_CACHE_DIR`` can be used to override the default cache location.  The
 parameter ``--no-cache`` disables the cache entirely. In this case, all data
-is loaded from the repo.
+is loaded from the repository.
+
+If a cache location is explicitly specified, then the ``check`` command will use
+that location to store its temporary cache. See :ref:`checking-integrity` for
+more details.
 
 The cache is ephemeral: When a file cannot be read from the cache, it is loaded
 from the repository.
 
 Within the cache directory, there's a sub directory for each repository the
-cache was used with. Restic updates the timestamps of a repo directory each
+cache was used with. Restic updates the timestamps of a repository directory each
 time it is used, so by looking at the timestamps of the sub directories of the
 cache directory it can decide which sub directories are old and probably not
 needed any more. You can either remove these directories manually, or run a

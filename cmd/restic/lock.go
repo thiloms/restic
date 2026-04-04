@@ -2,132 +2,49 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"os"
-	"sync"
-	"time"
 
-	"github.com/restic/restic/internal/debug"
-	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/global"
 	"github.com/restic/restic/internal/repository"
-	"github.com/restic/restic/internal/restic"
+	"github.com/restic/restic/internal/ui/progress"
 )
 
-var globalLocks struct {
-	locks         []*restic.Lock
-	cancelRefresh chan struct{}
-	refreshWG     sync.WaitGroup
-	sync.Mutex
-}
-
-func lockRepo(repo *repository.Repository) (*restic.Lock, error) {
-	return lockRepository(repo, false)
-}
-
-func lockRepoExclusive(repo *repository.Repository) (*restic.Lock, error) {
-	return lockRepository(repo, true)
-}
-
-func lockRepository(repo *repository.Repository, exclusive bool) (*restic.Lock, error) {
-	lockFn := restic.NewLock
-	if exclusive {
-		lockFn = restic.NewExclusiveLock
-	}
-
-	lock, err := lockFn(context.TODO(), repo)
+func internalOpenWithLocked(ctx context.Context, gopts global.Options, dryRun bool, exclusive bool, printer progress.Printer) (context.Context, *repository.Repository, func(), error) {
+	repo, err := global.OpenRepository(ctx, gopts, printer)
 	if err != nil {
-		return nil, errors.Fatalf("unable to create lock in backend: %v", err)
-	}
-	debug.Log("create lock %p (exclusive %v)", lock, exclusive)
-
-	globalLocks.Lock()
-	if globalLocks.cancelRefresh == nil {
-		debug.Log("start goroutine for lock refresh")
-		globalLocks.cancelRefresh = make(chan struct{})
-		globalLocks.refreshWG = sync.WaitGroup{}
-		globalLocks.refreshWG.Add(1)
-		go refreshLocks(&globalLocks.refreshWG, globalLocks.cancelRefresh)
+		return nil, nil, nil, err
 	}
 
-	globalLocks.locks = append(globalLocks.locks, lock)
-	globalLocks.Unlock()
+	unlock := func() {}
+	if !dryRun {
+		var lock *repository.Unlocker
 
-	return lock, err
-}
-
-var refreshInterval = 5 * time.Minute
-
-func refreshLocks(wg *sync.WaitGroup, done <-chan struct{}) {
-	debug.Log("start")
-	defer func() {
-		wg.Done()
-		globalLocks.Lock()
-		globalLocks.cancelRefresh = nil
-		globalLocks.Unlock()
-	}()
-
-	ticker := time.NewTicker(refreshInterval)
-
-	for {
-		select {
-		case <-done:
-			debug.Log("terminate")
-			return
-		case <-ticker.C:
-			debug.Log("refreshing locks")
-			globalLocks.Lock()
-			for _, lock := range globalLocks.locks {
-				err := lock.Refresh(context.TODO())
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "unable to refresh lock: %v\n", err)
-				}
+		lock, ctx, err = repository.Lock(ctx, repo, exclusive, gopts.RetryLock, func(msg string) {
+			if !gopts.JSON {
+				printer.P("%s", msg)
 			}
-			globalLocks.Unlock()
+		}, printer.E)
+		if err != nil {
+			return nil, nil, nil, err
 		}
-	}
-}
 
-func unlockRepo(lock *restic.Lock) error {
-	globalLocks.Lock()
-	defer globalLocks.Unlock()
-
-	for i := 0; i < len(globalLocks.locks); i++ {
-		if lock == globalLocks.locks[i] {
-			// remove the lock from the repo
-			debug.Log("unlocking repository with lock %v", lock)
-			if err := lock.Unlock(); err != nil {
-				debug.Log("error while unlocking: %v", err)
-				return err
-			}
-
-			// remove the lock from the list of locks
-			globalLocks.locks = append(globalLocks.locks[:i], globalLocks.locks[i+1:]...)
-			return nil
-		}
+		unlock = lock.Unlock
+	} else {
+		repo.SetDryRun()
 	}
 
-	debug.Log("unable to find lock %v in the global list of locks, ignoring", lock)
-
-	return nil
+	return ctx, repo, unlock, nil
 }
 
-func unlockAll() error {
-	globalLocks.Lock()
-	defer globalLocks.Unlock()
-
-	debug.Log("unlocking %d locks", len(globalLocks.locks))
-	for _, lock := range globalLocks.locks {
-		if err := lock.Unlock(); err != nil {
-			debug.Log("error while unlocking: %v", err)
-			return err
-		}
-		debug.Log("successfully removed lock")
-	}
-	globalLocks.locks = globalLocks.locks[:0]
-
-	return nil
+func openWithReadLock(ctx context.Context, gopts global.Options, noLock bool, printer progress.Printer) (context.Context, *repository.Repository, func(), error) {
+	// TODO enforce read-only operations once the locking code has moved to the repository
+	return internalOpenWithLocked(ctx, gopts, noLock, false, printer)
 }
 
-func init() {
-	AddCleanupHandler(unlockAll)
+func openWithAppendLock(ctx context.Context, gopts global.Options, dryRun bool, printer progress.Printer) (context.Context, *repository.Repository, func(), error) {
+	// TODO enforce non-exclusive operations once the locking code has moved to the repository
+	return internalOpenWithLocked(ctx, gopts, dryRun, false, printer)
+}
+
+func openWithExclusiveLock(ctx context.Context, gopts global.Options, dryRun bool, printer progress.Printer) (context.Context, *repository.Repository, func(), error) {
+	return internalOpenWithLocked(ctx, gopts, dryRun, true, printer)
 }

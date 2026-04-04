@@ -2,46 +2,111 @@ package s3
 
 import (
 	"context"
+	"fmt"
+	"hash"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/restic/restic/internal/backend"
-	"github.com/restic/restic/internal/errors"
-	"github.com/restic/restic/internal/restic"
-
-	"github.com/minio/minio-go/v6"
-	"github.com/minio/minio-go/v6/pkg/credentials"
-
+	"github.com/restic/restic/internal/backend/layout"
+	"github.com/restic/restic/internal/backend/location"
+	"github.com/restic/restic/internal/backend/util"
 	"github.com/restic/restic/internal/debug"
+	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/feature"
+
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 // Backend stores data on an S3 endpoint.
 type Backend struct {
 	client *minio.Client
-	sem    *backend.Semaphore
 	cfg    Config
-	backend.Layout
+	layout.Layout
 }
 
 // make sure that *Backend implements backend.Backend
-var _ restic.Backend = &Backend{}
+var _ backend.Backend = &Backend{}
 
-const defaultLayout = "default"
+var archiveClasses = []string{"GLACIER", "DEEP_ARCHIVE"}
+
+type warmupStatus int
+
+const (
+	warmupStatusCold warmupStatus = iota
+	warmupStatusWarmingUp
+	warmupStatusWarm
+	warmupStatusLukewarm
+)
+
+func NewFactory() location.Factory {
+	return location.NewHTTPBackendFactory("s3", ParseConfig, location.NoPassword, Create, Open)
+}
 
 func open(cfg Config, rt http.RoundTripper) (*Backend, error) {
 	debug.Log("open, config %#v", cfg)
+
+	if cfg.EnableRestore && !feature.Flag.Enabled(feature.S3Restore) {
+		return nil, fmt.Errorf("feature flag `s3-restore` is required to use `-o s3.enable-restore=true`")
+	}
 
 	if cfg.MaxRetries > 0 {
 		minio.MaxRetry = int(cfg.MaxRetries)
 	}
 
+	creds, err := getCredentials(cfg, rt)
+	if err != nil {
+		return nil, errors.Wrap(err, "s3.getCredentials")
+	}
+
+	options := &minio.Options{
+		Creds:     creds,
+		Secure:    !cfg.UseHTTP,
+		Region:    cfg.Region,
+		Transport: rt,
+	}
+
+	switch strings.ToLower(cfg.BucketLookup) {
+	case "", "auto":
+		options.BucketLookup = minio.BucketLookupAuto
+	case "dns":
+		options.BucketLookup = minio.BucketLookupDNS
+	case "path":
+		options.BucketLookup = minio.BucketLookupPath
+	default:
+		return nil, fmt.Errorf(`bad bucket-lookup style %q must be "auto", "path" or "dns"`, cfg.BucketLookup)
+	}
+
+	client, err := minio.New(cfg.Endpoint, options)
+	if err != nil {
+		return nil, errors.Wrap(err, "minio.New")
+	}
+
+	be := &Backend{
+		client: client,
+		cfg:    cfg,
+		Layout: layout.NewDefaultLayout(cfg.Prefix, path.Join),
+	}
+
+	return be, nil
+}
+
+// getCredentials -- runs through the various credential types and returns the first one that works.
+// additionally if the user has specified a role to assume, it will do that as well.
+func getCredentials(cfg Config, tr http.RoundTripper) (*credentials.Credentials, error) {
+	if cfg.UnsafeAnonymousAuth {
+		return credentials.New(&credentials.Static{}), nil
+	}
+
 	// Chains all credential types, in the following order:
-	// 	- Static credentials provided by user
+	// 	- Static credentials (test only)
 	//	- AWS env vars (i.e. AWS_ACCESS_KEY_ID)
 	//  - Minio env vars (i.e. MINIO_ACCESS_KEY)
 	//  - AWS creds file (i.e. AWS_SHARED_CREDENTIALS_FILE or ~/.aws/credentials)
@@ -50,66 +115,102 @@ func open(cfg Config, rt http.RoundTripper) (*Backend, error) {
 	//    call to a pre-defined endpoint, only valid inside
 	//    configured ec2 instances)
 	creds := credentials.NewChainCredentials([]credentials.Provider{
-		&credentials.EnvAWS{},
-		&credentials.Static{
+		&credentials.Static{ // test only
 			Value: credentials.Value{
 				AccessKeyID:     cfg.KeyID,
-				SecretAccessKey: cfg.Secret,
+				SecretAccessKey: cfg.Secret.Unwrap(),
 			},
 		},
+		&credentials.EnvAWS{},
 		&credentials.EnvMinio{},
 		&credentials.FileAWSCredentials{},
 		&credentials.FileMinioClient{},
-		&credentials.IAM{
-			Client: &http.Client{
-				Transport: http.DefaultTransport,
-			},
-		},
+		&credentials.IAM{},
 	})
-	client, err := minio.NewWithCredentials(cfg.Endpoint, creds, !cfg.UseHTTP, cfg.Region)
+	client := &http.Client{Transport: tr}
+
+	c, err := creds.GetWithContext(&credentials.CredContext{Client: client})
 	if err != nil {
-		return nil, errors.Wrap(err, "minio.NewWithCredentials")
+		return nil, errors.Wrap(err, "creds.Get")
 	}
 
-	sem, err := backend.NewSemaphore(cfg.Connections)
-	if err != nil {
-		return nil, err
+	if c.SignerType == credentials.SignatureAnonymous {
+		keyID := os.Getenv("AWS_ACCESS_KEY_ID")
+		secret := os.Getenv("AWS_SECRET_ACCESS_KEY")
+		if keyID == "" && secret != "" {
+			return nil, errors.Fatalf("no credentials found. $AWS_SECRET_ACCESS_KEY is set but $AWS_ACCESS_KEY_ID is empty")
+		} else if keyID != "" && secret == "" {
+			return nil, errors.Fatalf("no credentials found. $AWS_ACCESS_KEY_ID is set but $AWS_SECRET_ACCESS_KEY is empty")
+		}
+
+		// Fail if no credentials were found to prevent repeated attempts to (unsuccessfully) retrieve new credentials.
+		// The first attempt still has to timeout which slows down restic usage considerably. Thus, migrate towards forcing
+		// users to explicitly decide between authenticated and anonymous access.
+		return nil, fmt.Errorf("no credentials found. Use `-o s3.unsafe-anonymous-auth=true` for anonymous authentication")
 	}
 
-	be := &Backend{
-		client: client,
-		sem:    sem,
-		cfg:    cfg,
+	roleArn := os.Getenv("RESTIC_AWS_ASSUME_ROLE_ARN")
+	if roleArn != "" {
+		// use the region provided by the configuration by default
+		awsRegion := cfg.Region
+		// allow the region to be overridden if for some reason it is required
+		if os.Getenv("RESTIC_AWS_ASSUME_ROLE_REGION") != "" {
+			awsRegion = os.Getenv("RESTIC_AWS_ASSUME_ROLE_REGION")
+		}
+
+		sessionName := os.Getenv("RESTIC_AWS_ASSUME_ROLE_SESSION_NAME")
+		externalID := os.Getenv("RESTIC_AWS_ASSUME_ROLE_EXTERNAL_ID")
+		policy := os.Getenv("RESTIC_AWS_ASSUME_ROLE_POLICY")
+		stsEndpoint := os.Getenv("RESTIC_AWS_ASSUME_ROLE_STS_ENDPOINT")
+
+		if stsEndpoint == "" {
+			if awsRegion != "" {
+				if strings.HasPrefix(awsRegion, "cn-") {
+					stsEndpoint = "https://sts." + awsRegion + ".amazonaws.com.cn"
+				} else {
+					stsEndpoint = "https://sts." + awsRegion + ".amazonaws.com"
+				}
+			} else {
+				stsEndpoint = "https://sts.amazonaws.com"
+			}
+		}
+
+		opts := credentials.STSAssumeRoleOptions{
+			RoleARN:         roleArn,
+			AccessKey:       c.AccessKeyID,
+			SecretKey:       c.SecretAccessKey,
+			SessionToken:    c.SessionToken,
+			RoleSessionName: sessionName,
+			ExternalID:      externalID,
+			Policy:          policy,
+			Location:        awsRegion,
+		}
+
+		creds, err = credentials.NewSTSAssumeRole(stsEndpoint, opts)
+		if err != nil {
+			return nil, errors.Wrap(err, "creds.AssumeRole")
+		}
 	}
 
-	client.SetCustomTransport(rt)
-
-	l, err := backend.ParseLayout(be, cfg.Layout, defaultLayout, cfg.Prefix)
-	if err != nil {
-		return nil, err
-	}
-
-	be.Layout = l
-
-	return be, nil
+	return creds, nil
 }
 
 // Open opens the S3 backend at bucket and region. The bucket is created if it
 // does not exist yet.
-func Open(cfg Config, rt http.RoundTripper) (restic.Backend, error) {
+func Open(_ context.Context, cfg Config, rt http.RoundTripper, _ func(string, ...interface{})) (backend.Backend, error) {
 	return open(cfg, rt)
 }
 
 // Create opens the S3 backend at bucket and region and creates the bucket if
 // it does not exist yet.
-func Create(cfg Config, rt http.RoundTripper) (restic.Backend, error) {
+func Create(ctx context.Context, cfg Config, rt http.RoundTripper, _ func(string, ...interface{})) (backend.Backend, error) {
 	be, err := open(cfg, rt)
 	if err != nil {
 		return nil, errors.Wrap(err, "open")
 	}
-	found, err := be.client.BucketExists(cfg.Bucket)
+	found, err := be.client.BucketExists(ctx, cfg.Bucket)
 
-	if err != nil && be.IsAccessDenied(err) {
+	if err != nil && isAccessDenied(err) {
 		err = nil
 		found = true
 	}
@@ -121,7 +222,7 @@ func Create(cfg Config, rt http.RoundTripper) (restic.Backend, error) {
 
 	if !found {
 		// create new bucket with default ACL in default region
-		err = be.client.MakeBucket(cfg.Bucket, "")
+		err = be.client.MakeBucket(ctx, cfg.Bucket, minio.MakeBucketOptions{})
 		if err != nil {
 			return nil, errors.Wrap(err, "client.MakeBucket")
 		}
@@ -130,100 +231,45 @@ func Create(cfg Config, rt http.RoundTripper) (restic.Backend, error) {
 	return be, nil
 }
 
-// IsAccessDenied returns true if the error is caused by Access Denied.
-func (be *Backend) IsAccessDenied(err error) bool {
-	debug.Log("IsAccessDenied(%T, %#v)", err, err)
+// isAccessDenied returns true if the error is caused by Access Denied.
+func isAccessDenied(err error) bool {
+	debug.Log("isAccessDenied(%T, %#v)", err, err)
 
-	if e, ok := errors.Cause(err).(minio.ErrorResponse); ok && e.Code == "AccessDenied" {
-		return true
-	}
-
-	return false
+	var e minio.ErrorResponse
+	return errors.As(err, &e) && e.Code == "AccessDenied"
 }
 
 // IsNotExist returns true if the error is caused by a not existing file.
 func (be *Backend) IsNotExist(err error) bool {
-	debug.Log("IsNotExist(%T, %#v)", err, err)
-	if os.IsNotExist(errors.Cause(err)) {
+	var e minio.ErrorResponse
+	return errors.As(err, &e) && e.Code == "NoSuchKey"
+}
+
+func (be *Backend) IsPermanentError(err error) bool {
+	if be.IsNotExist(err) {
 		return true
 	}
 
-	if e, ok := errors.Cause(err).(minio.ErrorResponse); ok && e.Code == "NoSuchKey" {
-		return true
+	var merr minio.ErrorResponse
+	if errors.As(err, &merr) {
+		if merr.Code == "InvalidRange" || merr.Code == "AccessDenied" {
+			return true
+		}
 	}
 
 	return false
 }
 
-// Join combines path components with slashes.
-func (be *Backend) Join(p ...string) string {
-	return path.Join(p...)
-}
-
-type fileInfo struct {
-	name    string
-	size    int64
-	mode    os.FileMode
-	modTime time.Time
-	isDir   bool
-}
-
-func (fi fileInfo) Name() string       { return fi.name }    // base name of the file
-func (fi fileInfo) Size() int64        { return fi.size }    // length in bytes for regular files; system-dependent for others
-func (fi fileInfo) Mode() os.FileMode  { return fi.mode }    // file mode bits
-func (fi fileInfo) ModTime() time.Time { return fi.modTime } // modification time
-func (fi fileInfo) IsDir() bool        { return fi.isDir }   // abbreviation for Mode().IsDir()
-func (fi fileInfo) Sys() interface{}   { return nil }        // underlying data source (can return nil)
-
-// ReadDir returns the entries for a directory.
-func (be *Backend) ReadDir(dir string) (list []os.FileInfo, err error) {
-	debug.Log("ReadDir(%v)", dir)
-
-	// make sure dir ends with a slash
-	if dir[len(dir)-1] != '/' {
-		dir += "/"
+func (be *Backend) Properties() backend.Properties {
+	return backend.Properties{
+		Connections:      be.cfg.Connections,
+		HasAtomicReplace: true,
 	}
-
-	done := make(chan struct{})
-	defer close(done)
-
-	for obj := range be.client.ListObjects(be.cfg.Bucket, dir, false, done) {
-		if obj.Err != nil {
-			return nil, err
-		}
-
-		if obj.Key == "" {
-			continue
-		}
-
-		name := strings.TrimPrefix(obj.Key, dir)
-		// Sometimes s3 returns an entry for the dir itself. Ignore it.
-		if name == "" {
-			continue
-		}
-		entry := fileInfo{
-			name:    name,
-			size:    obj.Size,
-			modTime: obj.LastModified,
-		}
-
-		if name[len(name)-1] == '/' {
-			entry.isDir = true
-			entry.mode = os.ModeDir | 0755
-			entry.name = name[:len(name)-1]
-		} else {
-			entry.mode = 0644
-		}
-
-		list = append(list, entry)
-	}
-
-	return list, nil
 }
 
-// Location returns this backend's location (the bucket name).
-func (be *Backend) Location() string {
-	return be.Join(be.cfg.Bucket, be.cfg.Prefix)
+// Hasher may return a hash function for calculating a content hash for the backend
+func (be *Backend) Hasher() hash.Hash {
+	return nil
 }
 
 // Path returns the path in the bucket that is used for this backend.
@@ -231,71 +277,57 @@ func (be *Backend) Path() string {
 	return be.cfg.Prefix
 }
 
+// useStorageClass returns whether file should be saved in the provided Storage Class
+// For archive storage classes, only data files are stored using that class; metadata
+// must remain instantly accessible.
+func (be *Backend) useStorageClass(h backend.Handle) bool {
+	isDataFile := h.Type == backend.PackFile && !h.IsMetadata
+	isArchiveClass := slices.Contains(archiveClasses, be.cfg.StorageClass)
+	return !isArchiveClass || isDataFile
+}
+
 // Save stores data in the backend at the handle.
-func (be *Backend) Save(ctx context.Context, h restic.Handle, rd restic.RewindReader) error {
-	debug.Log("Save %v", h)
-
-	if err := h.Valid(); err != nil {
-		return err
-	}
-
+func (be *Backend) Save(ctx context.Context, h backend.Handle, rd backend.RewindReader) error {
 	objName := be.Filename(h)
 
-	be.sem.GetToken()
-	defer be.sem.ReleaseToken()
+	opts := minio.PutObjectOptions{
+		ContentType: "application/octet-stream",
+		// the only option with the high-level api is to let the library handle the checksum computation
+		SendContentMd5: true,
+		// only use multipart uploads for very large files
+		PartSize: 200 * 1024 * 1024,
+	}
+	if be.useStorageClass(h) {
+		opts.StorageClass = be.cfg.StorageClass
+	}
 
-	opts := minio.PutObjectOptions{StorageClass: be.cfg.StorageClass}
-	opts.ContentType = "application/octet-stream"
+	info, err := be.client.PutObject(ctx, be.cfg.Bucket, objName, io.NopCloser(rd), rd.Length(), opts)
 
-	debug.Log("PutObject(%v, %v, %v)", be.cfg.Bucket, objName, rd.Length())
-	n, err := be.client.PutObjectWithContext(ctx, be.cfg.Bucket, objName, ioutil.NopCloser(rd), int64(rd.Length()), opts)
-
-	debug.Log("%v -> %v bytes, err %#v: %v", objName, n, err, err)
+	// sanity check
+	if err == nil && info.Size != rd.Length() {
+		return errors.Errorf("wrote %d bytes instead of the expected %d bytes", info.Size, rd.Length())
+	}
 
 	return errors.Wrap(err, "client.PutObject")
 }
 
-// wrapReader wraps an io.ReadCloser to run an additional function on Close.
-type wrapReader struct {
-	io.ReadCloser
-	f func()
-}
-
-func (wr wrapReader) Close() error {
-	err := wr.ReadCloser.Close()
-	wr.f()
-	return err
-}
-
 // Load runs fn with a reader that yields the contents of the file at h at the
 // given offset.
-func (be *Backend) Load(ctx context.Context, h restic.Handle, length int, offset int64, fn func(rd io.Reader) error) error {
-	return backend.DefaultLoad(ctx, h, length, offset, be.openReader, fn)
+func (be *Backend) Load(ctx context.Context, h backend.Handle, length int, offset int64, fn func(rd io.Reader) error) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	return util.DefaultLoad(ctx, h, length, offset, be.openReader, fn)
 }
 
-func (be *Backend) openReader(ctx context.Context, h restic.Handle, length int, offset int64) (io.ReadCloser, error) {
-	debug.Log("Load %v, length %v, offset %v from %v", h, length, offset, be.Filename(h))
-	if err := h.Valid(); err != nil {
-		return nil, err
-	}
-
-	if offset < 0 {
-		return nil, errors.New("offset is negative")
-	}
-
-	if length < 0 {
-		return nil, errors.Errorf("invalid length %d", length)
-	}
-
+func (be *Backend) openReader(ctx context.Context, h backend.Handle, length int, offset int64) (io.ReadCloser, error) {
 	objName := be.Filename(h)
 	opts := minio.GetObjectOptions{}
 
 	var err error
 	if length > 0 {
-		debug.Log("range: %v-%v", offset, offset+int64(length)-1)
 		err = opts.SetRange(offset, offset+int64(length)-1)
 	} else if offset > 0 {
-		debug.Log("range: %v-", offset)
 		err = opts.SetRange(offset, 0)
 	}
 
@@ -303,46 +335,37 @@ func (be *Backend) openReader(ctx context.Context, h restic.Handle, length int, 
 		return nil, errors.Wrap(err, "SetRange")
 	}
 
-	be.sem.GetToken()
 	coreClient := minio.Core{Client: be.client}
-	rd, _, _, err := coreClient.GetObjectWithContext(ctx, be.cfg.Bucket, objName, opts)
+	rd, info, _, err := coreClient.GetObject(ctx, be.cfg.Bucket, objName, opts)
 	if err != nil {
-		be.sem.ReleaseToken()
 		return nil, err
 	}
 
-	closeRd := wrapReader{
-		ReadCloser: rd,
-		f: func() {
-			debug.Log("Close()")
-			be.sem.ReleaseToken()
-		},
+	if feature.Flag.Enabled(feature.BackendErrorRedesign) && length > 0 {
+		if info.Size > 0 && info.Size != int64(length) {
+			_ = rd.Close()
+			return nil, minio.ErrorResponse{Code: "InvalidRange", Message: "restic-file-too-short"}
+		}
 	}
 
-	return closeRd, err
+	return rd, err
 }
 
 // Stat returns information about a blob.
-func (be *Backend) Stat(ctx context.Context, h restic.Handle) (bi restic.FileInfo, err error) {
-	debug.Log("%v", h)
-
+func (be *Backend) Stat(ctx context.Context, h backend.Handle) (bi backend.FileInfo, err error) {
 	objName := be.Filename(h)
 	var obj *minio.Object
 
 	opts := minio.GetObjectOptions{}
 
-	be.sem.GetToken()
-	obj, err = be.client.GetObjectWithContext(ctx, be.cfg.Bucket, objName, opts)
+	obj, err = be.client.GetObject(ctx, be.cfg.Bucket, objName, opts)
 	if err != nil {
-		debug.Log("GetObject() err %v", err)
-		be.sem.ReleaseToken()
-		return restic.FileInfo{}, errors.Wrap(err, "client.GetObject")
+		return backend.FileInfo{}, errors.Wrap(err, "client.GetObject")
 	}
 
 	// make sure that the object is closed properly.
 	defer func() {
 		e := obj.Close()
-		be.sem.ReleaseToken()
 		if err == nil {
 			err = errors.Wrap(e, "Close")
 		}
@@ -350,39 +373,17 @@ func (be *Backend) Stat(ctx context.Context, h restic.Handle) (bi restic.FileInf
 
 	fi, err := obj.Stat()
 	if err != nil {
-		debug.Log("Stat() err %v", err)
-		return restic.FileInfo{}, errors.Wrap(err, "Stat")
+		return backend.FileInfo{}, errors.Wrap(err, "Stat")
 	}
 
-	return restic.FileInfo{Size: fi.Size, Name: h.Name}, nil
-}
-
-// Test returns true if a blob of the given type and name exists in the backend.
-func (be *Backend) Test(ctx context.Context, h restic.Handle) (bool, error) {
-	found := false
-	objName := be.Filename(h)
-
-	be.sem.GetToken()
-	_, err := be.client.StatObject(be.cfg.Bucket, objName, minio.StatObjectOptions{})
-	be.sem.ReleaseToken()
-
-	if err == nil {
-		found = true
-	}
-
-	// If error, then not found
-	return found, nil
+	return backend.FileInfo{Size: fi.Size, Name: h.Name}, nil
 }
 
 // Remove removes the blob with the given name and type.
-func (be *Backend) Remove(ctx context.Context, h restic.Handle) error {
+func (be *Backend) Remove(ctx context.Context, h backend.Handle) error {
 	objName := be.Filename(h)
 
-	be.sem.GetToken()
-	err := be.client.RemoveObject(be.cfg.Bucket, objName)
-	be.sem.ReleaseToken()
-
-	debug.Log("Remove(%v) at %v -> err %v", h, objName, err)
+	err := be.client.RemoveObject(ctx, be.cfg.Bucket, objName, minio.RemoveObjectOptions{})
 
 	if be.IsNotExist(err) {
 		err = nil
@@ -393,9 +394,7 @@ func (be *Backend) Remove(ctx context.Context, h restic.Handle) error {
 
 // List runs fn for each file in the backend which has the type t. When an
 // error occurs (or fn returns an error), List stops and returns it.
-func (be *Backend) List(ctx context.Context, t restic.FileType, fn func(restic.FileInfo) error) error {
-	debug.Log("listing %v", t)
-
+func (be *Backend) List(ctx context.Context, t backend.FileType, fn func(backend.FileInfo) error) error {
 	prefix, recursive := be.Basedir(t)
 
 	// make sure prefix ends with a slash
@@ -406,10 +405,16 @@ func (be *Backend) List(ctx context.Context, t restic.FileType, fn func(restic.F
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	debug.Log("using ListObjectsV1(%v)", be.cfg.ListObjectsV1)
+
 	// NB: unfortunately we can't protect this with be.sem.GetToken() here.
 	// Doing so would enable a deadlock situation (gh-1399), as ListObjects()
 	// starts its own goroutine and returns results via a channel.
-	listresp := be.client.ListObjects(be.cfg.Bucket, prefix, recursive, ctx.Done())
+	listresp := be.client.ListObjects(ctx, be.cfg.Bucket, minio.ListObjectsOptions{
+		Prefix:    prefix,
+		Recursive: recursive,
+		UseV1:     be.cfg.ListObjectsV1,
+	})
 
 	for obj := range listresp {
 		if obj.Err != nil {
@@ -421,7 +426,7 @@ func (be *Backend) List(ctx context.Context, t restic.FileType, fn func(restic.F
 			continue
 		}
 
-		fi := restic.FileInfo{
+		fi := backend.FileInfo{
 			Name: path.Base(m),
 			Size: obj.Size,
 		}
@@ -443,65 +448,155 @@ func (be *Backend) List(ctx context.Context, t restic.FileType, fn func(restic.F
 	return ctx.Err()
 }
 
-// Remove keys for a specified backend type.
-func (be *Backend) removeKeys(ctx context.Context, t restic.FileType) error {
-	return be.List(ctx, restic.DataFile, func(fi restic.FileInfo) error {
-		return be.Remove(ctx, restic.Handle{Type: t, Name: fi.Name})
-	})
-}
-
 // Delete removes all restic keys in the bucket. It will not remove the bucket itself.
 func (be *Backend) Delete(ctx context.Context) error {
-	alltypes := []restic.FileType{
-		restic.DataFile,
-		restic.KeyFile,
-		restic.LockFile,
-		restic.SnapshotFile,
-		restic.IndexFile}
-
-	for _, t := range alltypes {
-		err := be.removeKeys(ctx, t)
-		if err != nil {
-			return nil
-		}
-	}
-
-	return be.Remove(ctx, restic.Handle{Type: restic.ConfigFile})
+	return util.DefaultDelete(ctx, be)
 }
 
 // Close does nothing
 func (be *Backend) Close() error { return nil }
 
-// Rename moves a file based on the new layout l.
-func (be *Backend) Rename(h restic.Handle, l backend.Layout) error {
-	debug.Log("Rename %v to %v", h, l)
-	oldname := be.Filename(h)
-	newname := l.Filename(h)
+// Warmup transitions handles from cold to hot storage if needed.
+func (be *Backend) Warmup(ctx context.Context, handles []backend.Handle) ([]backend.Handle, error) {
+	handlesWarmingUp := []backend.Handle{}
 
-	if oldname == newname {
-		debug.Log("  %v is already renamed", newname)
-		return nil
+	if be.cfg.EnableRestore {
+		for _, h := range handles {
+			filename := be.Filename(h)
+			isWarmingUp, err := be.requestRestore(ctx, filename)
+			if err != nil {
+				return handlesWarmingUp, err
+			}
+			if isWarmingUp {
+				debug.Log("s3 file is being restored: %s", filename)
+				handlesWarmingUp = append(handlesWarmingUp, h)
+			}
+		}
 	}
 
-	debug.Log("  %v -> %v", oldname, newname)
+	return handlesWarmingUp, nil
+}
 
-	src := minio.NewSourceInfo(be.cfg.Bucket, oldname, nil)
-
-	dst, err := minio.NewDestinationInfo(be.cfg.Bucket, newname, nil, nil)
+// requestRestore sends a glacier restore request on a given file.
+func (be *Backend) requestRestore(ctx context.Context, filename string) (bool, error) {
+	objectInfo, err := be.client.StatObject(ctx, be.cfg.Bucket, filename, minio.StatObjectOptions{})
 	if err != nil {
-		return errors.Wrap(err, "NewDestinationInfo")
+		return false, err
 	}
 
-	err = be.client.CopyObject(dst, src)
-	if err != nil && be.IsNotExist(err) {
-		debug.Log("copy failed: %v, seems to already have been renamed", err)
-		return nil
+	ws := be.getWarmupStatus(objectInfo)
+	switch ws {
+	case warmupStatusWarm:
+		return false, nil
+	case warmupStatusWarmingUp:
+		return true, nil
 	}
 
-	if err != nil {
-		debug.Log("copy failed: %v", err)
-		return err
+	opts := minio.RestoreRequest{}
+	opts.SetDays(be.cfg.RestoreDays)
+	opts.SetGlacierJobParameters(minio.GlacierJobParameters{Tier: minio.TierType(be.cfg.RestoreTier)})
+
+	if err := be.client.RestoreObject(ctx, be.cfg.Bucket, filename, "", opts); err != nil {
+		var e minio.ErrorResponse
+		if errors.As(err, &e) {
+			switch e.Code {
+			case "InvalidObjectState":
+				return false, nil
+			case "RestoreAlreadyInProgress":
+				return true, nil
+			}
+		}
+		return false, err
 	}
 
-	return be.client.RemoveObject(be.cfg.Bucket, oldname)
+	isWarmingUp := ws != warmupStatusLukewarm
+	return isWarmingUp, nil
+}
+
+// getWarmupStatus returns the warmup status of the provided object.
+func (be *Backend) getWarmupStatus(objectInfo minio.ObjectInfo) warmupStatus {
+	// We can't use objectInfo.StorageClass to get the storage class of the
+	// object because this field is only set during ListObjects operations.
+	// The response header is the documented way to get the storage class
+	// for GetObject/StatObject operations.
+	storageClass := objectInfo.Metadata.Get("X-Amz-Storage-Class")
+	isArchiveClass := slices.Contains(archiveClasses, storageClass)
+	if !isArchiveClass {
+		return warmupStatusWarm
+	}
+
+	restore := objectInfo.Restore
+	if restore != nil {
+		if restore.OngoingRestore {
+			return warmupStatusWarmingUp
+		}
+
+		minExpiryTime := time.Now().Add(time.Duration(be.cfg.RestoreDays) * 24 * time.Hour)
+		expiryTime := restore.ExpiryTime
+		if !expiryTime.IsZero() {
+			if minExpiryTime.Before(expiryTime) {
+				return warmupStatusWarm
+			}
+			return warmupStatusLukewarm
+		}
+	}
+
+	return warmupStatusCold
+}
+
+// WarmupWait waits until all handles are in hot storage.
+func (be *Backend) WarmupWait(ctx context.Context, handles []backend.Handle) error {
+	timeoutCtx, timeoutCtxCancel := context.WithTimeout(ctx, be.cfg.RestoreTimeout)
+	defer timeoutCtxCancel()
+
+	if be.cfg.EnableRestore {
+		for _, h := range handles {
+			filename := be.Filename(h)
+			err := be.waitForRestore(timeoutCtx, filename)
+			if err != nil {
+				return err
+			}
+			debug.Log("s3 file is restored: %s", filename)
+		}
+	}
+
+	return nil
+}
+
+// waitForRestore waits for a given file to be restored.
+func (be *Backend) waitForRestore(ctx context.Context, filename string) error {
+	for {
+		var objectInfo minio.ObjectInfo
+
+		// Restore requests can last many hours, therefore network may fail
+		// temporarily. We don't need to die in such even.
+		b := backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 10)
+		b = backoff.WithContext(b, ctx)
+		err := backoff.Retry(
+			func() (err error) {
+				objectInfo, err = be.client.StatObject(ctx, be.cfg.Bucket, filename, minio.StatObjectOptions{})
+				return
+			},
+			b,
+		)
+		if err != nil {
+			return err
+		}
+
+		ws := be.getWarmupStatus(objectInfo)
+		switch ws {
+		case warmupStatusLukewarm:
+			fallthrough
+		case warmupStatusWarm:
+			return nil
+		case warmupStatusCold:
+			return errors.New("waiting on S3 handle that is not warming up")
+		}
+
+		select {
+		case <-time.After(1 * time.Minute):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }

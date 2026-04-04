@@ -6,17 +6,18 @@ Ways to Help Out
 Thank you for your contribution! Please **open an issue first** (or add a
 comment to an existing issue) if you plan to work on any code or add a new
 feature. This way, duplicate work is prevented and we can discuss your ideas
-and design first.
+and design first. Small bugfixes are an exception to this rule, just open a
+pull request in this case.
 
 There are several ways you can help us out. First of all code contributions and
 bug fixes are most welcome. However even "minor" details as fixing spelling
 errors, improving documentation or pointing out usability issues are a great
 help also.
 
-
 The restic project uses the GitHub infrastructure (see the
 [project page](https://github.com/restic/restic)) for all related discussions
-as well as the `#restic` channel on `irc.freenode.net`.
+as well as the [forum](https://forum.restic.net/) and the `#restic` channel
+on [irc.libera.chat](https://kiwiirc.com/nextclient/#ircs://irc.libera.chat:6697/#restic).
 
 If you want to find an area that currently needs improving have a look at the
 open issues listed at the
@@ -25,7 +26,10 @@ for discussing enhancement to the restic tools.
 
 If you are unsure what to do, please have a look at the issues, especially
 those tagged
-[minor complexity](https://github.com/restic/restic/labels/minor%20complexity).
+[minor complexity](https://github.com/restic/restic/labels/help%3A%20minor%20complexity)
+or [good first issue](https://github.com/restic/restic/labels/help%3A%20good%20first%20issue).
+If you are already a bit experienced with the restic internals, take a look
+at the issues tagged as [help wanted](https://github.com/restic/restic/labels/help%3A%20wanted).
 
 
 Reporting Bugs
@@ -45,9 +49,8 @@ environment was used and so on. Please tell us at least the following things:
 Remember, the easier it is for us to reproduce the bug, the earlier it will be
 corrected!
 
-In addition, you can compile restic with debug support by running
-`go run build.go -tags debug` and instructing it to create a debug
-log by setting the environment variable `DEBUG_LOG` to a file, e.g. like this:
+In addition, you can instruct restic to create a debug log by setting the
+environment variable `DEBUG_LOG` to a file, e.g. like this:
 
     $ export DEBUG_LOG=/tmp/restic-debug.log
     $ restic backup ~/work
@@ -56,20 +59,28 @@ Please be aware that the debug log file will contain potentially sensitive
 things like file and directory names, so please either redact it before
 uploading it somewhere or post only the parts that are really relevant.
 
+If restic gets stuck, please also include a stacktrace in the description.
+On non-Windows systems, you can send a SIGQUIT signal to restic or press
+`Ctrl-\` to achieve the same result. This causes restic to print a stacktrace
+and then exit immediately. This will not damage your repository, however,
+it might be necessary to manually clean up stale lock files using
+`restic unlock`.
+
+On Windows, please set the environment variable `RESTIC_DEBUG_STACKTRACE_SIGINT`
+to `true` and press `Ctrl-C` to create a stacktrace.
+
+If you think restic uses too much memory or a too large cache directory, then
+please include the output of `restic stats --mode debug`.
+
 
 Development Environment
 =======================
 
-The repository contains several sets of directories with code: `cmd/` and
-`internal/` contain the code written for restic, whereas `vendor/` contains
-copies of libraries restic depends on. The libraries are managed with the
-command `go mod vendor`.
+The repository contains the code written for restic in the directories
+`cmd/` and `internal/`.
 
-Go >= 1.11
-----------
-
-For Go version 1.11 or later, you should clone the repo (without having
-`$GOPATH` set) and `cd` into the directory:
+Make sure you have the minimum required Go version installed. Clone the repo
+(without having `$GOPATH` set) and `cd` into the directory:
 
     $ unset GOPATH
     $ git clone https://github.com/restic/restic
@@ -79,39 +90,41 @@ Then use the `go` tool to build restic:
 
     $ go build ./cmd/restic
     $ ./restic version
-    restic 0.9.2-dev (compiled manually) compiled with go1.11 on linux/amd64
+    restic 0.14.0-dev (compiled manually) compiled with go1.19 on linux/amd64
+
+To create a debug build use:
+
+    $ go build -tags debug ./cmd/restic
 
 You can run all tests with the following command:
 
     $ go test ./...
 
-Go < 1.11
----------
 
-In order to compile restic with Go before 1.11, it needs to be checked out at
-the right path within a `GOPATH`. The concept of a `GOPATH` is explained in
-["How to write Go code"](https://golang.org/doc/code.html).
+Performance and Memory Usage Issues
+===================================
 
-If you do not have a directory with Go code yet, executing the following
-instructions in your shell will create one for you and check out the restic
-repo:
+Debug builds of restic support the `--block-profile`, `--cpu-profile`,
+`--mem-profile`, and `--trace-profile` options which collect performance data
+that later on can be analyzed using the go tools:
 
-    $ export GOPATH="$HOME/go"
-    $ mkdir -p "$GOPATH/src/github.com/restic"
-    $ cd "$GOPATH/src/github.com/restic"
-    $ git clone https://github.com/restic/restic
-    $ cd restic
+    $ restic --cpu-profile . [...]
+    $ go tool pprof -http localhost:12345 cpu.pprof
 
-You can then build restic as follows:
+To analyze a trace profile use `go tool trace -http=localhost:12345 trace.out`.
 
-    $ go build ./cmd/restic
-    $ ./restic version
-    restic compiled manually
-    compiled with go1.8.3 on linux/amd64
+As the memory usage of restic changes over time, it may be useful to capture a
+snapshot of the current heap. This is possible using then `--listen-profile`
+option. Then while restic runs you can query and afterwards analyze the heap statistics.
 
-The following commands can be used to run all the tests:
+    $ restic --listen-profile localhost:12345 [...]
+    $ curl http://localhost:12345/debug/pprof/heap -o heap.pprof
+    $ go tool pprof -http localhost:12345 heap.pprof
 
-    $ go test ./...
+Further useful tools are setting the environment variable `GODEBUG=gctrace=1`,
+which provides information about garbage collector runs. For a graphical variant
+combine this with gcvis.
+
 
 Providing Patches
 =================
@@ -153,7 +166,10 @@ down to the following steps:
     writing, ask yourself: If I were the user, what would I need to be aware
     of with this change?
 
- 8. Once your code looks good and passes all the tests, we'll merge it. Thanks
+ 8. Do not edit the man pages under `doc/man` or `doc/manual_rest.rst` -
+    these are autogenerated before new releases.
+
+ 9. Once your code looks good and passes all the tests, we'll merge it. Thanks
     a lot for your contribution!
 
 Please provide the patches for each bug or feature in a separate branch and
@@ -170,6 +186,14 @@ Installing the script `fmt-check` from https://github.com/edsrzf/gofmt-git-hook
 locally as a pre-commit hook checks formatting before committing automatically,
 just copy this script to `.git/hooks/pre-commit`.
 
+The project is using the program
+[`golangci-lint`](https://github.com/golangci/golangci-lint) to run a list of
+linters and checkers. It will be run on the code when you submit a PR. In order
+to check your code beforehand, you can run `golangci-lint run` manually.
+Eventually, we will enable `golangci-lint` for the whole code base. For now,
+you can ignore warnings printed for lines you did not modify, those will be
+ignored by the CI.
+
 For each pull request, several different systems run the integration tests on
 Linux, macOS and Windows. We won't merge any code that does not pass all tests
 for all systems, so when a tests fails, try to find out what's wrong and fix
@@ -177,6 +201,9 @@ it. If you need help on this, please leave a comment in the pull request, and
 we'll be glad to assist. Having a PR with failing integration tests is nothing
 to be ashamed of. In contrast, that happens regularly for all of us. That's
 what the tests are there for.
+
+More details of how to structure tests can be found here at
+[writing tests](https://restic.readthedocs.io/en/stable/090_participating.html#writing-tests).
 
 Git Commits
 -----------

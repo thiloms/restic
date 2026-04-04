@@ -1,312 +1,309 @@
 package main
 
 import (
-	"fmt"
-	"time"
+	"context"
+	"math"
+	"runtime"
+	"strconv"
+	"strings"
 
+	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
-	"github.com/restic/restic/internal/index"
+	"github.com/restic/restic/internal/global"
 	"github.com/restic/restic/internal/repository"
 	"github.com/restic/restic/internal/restic"
+	"github.com/restic/restic/internal/ui"
+	"github.com/restic/restic/internal/ui/progress"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
-var cmdPrune = &cobra.Command{
-	Use:   "prune [flags]",
-	Short: "Remove unneeded data from the repository",
-	Long: `
+func newPruneCommand(globalOptions *global.Options) *cobra.Command {
+	var opts PruneOptions
+
+	cmd := &cobra.Command{
+		Use:   "prune [flags]",
+		Short: "Remove unneeded data from the repository",
+		Long: `
 The "prune" command checks the repository and removes data that is not
 referenced and therefore not needed any more.
 
 EXIT STATUS
 ===========
 
-Exit status is 0 if the command was successful, and non-zero if there was any error.
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
+Exit status is 10 if the repository does not exist.
+Exit status is 11 if the repository is already locked.
+Exit status is 12 if the password is incorrect.
 `,
-	DisableAutoGenTag: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runPrune(globalOptions)
-	},
+		GroupID:           cmdGroupDefault,
+		DisableAutoGenTag: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runPrune(cmd.Context(), opts, *globalOptions, globalOptions.Term)
+		},
+	}
+
+	opts.AddFlags(cmd.Flags())
+	return cmd
 }
 
-func init() {
-	cmdRoot.AddCommand(cmdPrune)
+// PruneOptions collects all options for the cleanup command.
+type PruneOptions struct {
+	DryRun                bool
+	UnsafeNoSpaceRecovery string
+
+	unsafeRecovery bool
+
+	MaxUnused      string
+	maxUnusedBytes func(used uint64) (unused uint64) // calculates the number of unused bytes after repacking, according to MaxUnused
+
+	MaxRepackSize  string
+	MaxRepackBytes uint64
+
+	RepackCacheableOnly bool
+	RepackSmall         bool
+	RepackUncompressed  bool
+
+	SmallPackSize  string
+	SmallPackBytes uint64
 }
 
-func shortenStatus(maxLength int, s string) string {
-	if len(s) <= maxLength {
-		return s
-	}
-
-	if maxLength < 3 {
-		return s[:maxLength]
-	}
-
-	return s[:maxLength-3] + "..."
+func (opts *PruneOptions) AddFlags(f *pflag.FlagSet) {
+	opts.AddLimitedFlags(f)
+	f.BoolVarP(&opts.DryRun, "dry-run", "n", false, "do not modify the repository, just print what would be done")
+	f.StringVarP(&opts.UnsafeNoSpaceRecovery, "unsafe-recover-no-free-space", "", "", "UNSAFE, READ THE DOCUMENTATION BEFORE USING! Try to recover a repository stuck with no free space. Do not use without trying out 'prune --max-repack-size 0' first.")
 }
 
-// newProgressMax returns a progress that counts blobs.
-func newProgressMax(show bool, max uint64, description string) *restic.Progress {
-	if !show {
-		return nil
-	}
-
-	p := restic.NewProgress()
-
-	p.OnUpdate = func(s restic.Stat, d time.Duration, ticker bool) {
-		status := fmt.Sprintf("[%s] %s  %d / %d %s",
-			formatDuration(d),
-			formatPercent(s.Blobs, max),
-			s.Blobs, max, description)
-
-		if w := stdoutTerminalWidth(); w > 0 {
-			status = shortenStatus(w, status)
-		}
-
-		PrintProgress("%s", status)
-	}
-
-	p.OnDone = func(s restic.Stat, d time.Duration, ticker bool) {
-		fmt.Printf("\n")
-	}
-
-	return p
+func (opts *PruneOptions) AddLimitedFlags(f *pflag.FlagSet) {
+	f.StringVar(&opts.MaxUnused, "max-unused", "5%", "tolerate given `limit` of unused data (absolute value in bytes with suffixes k/K, m/M, g/G, t/T, a value in % or the word 'unlimited')")
+	f.StringVar(&opts.MaxRepackSize, "max-repack-size", "", "stop after repacking this much data in total (allowed suffixes for `size`: k/K, m/M, g/G, t/T)")
+	f.BoolVar(&opts.RepackCacheableOnly, "repack-cacheable-only", false, "only repack packs which are cacheable")
+	f.BoolVar(&opts.RepackSmall, "repack-small", false, "repack pack files below 80% of target pack size")
+	f.BoolVar(&opts.RepackUncompressed, "repack-uncompressed", false, "repack all uncompressed data")
+	f.StringVar(&opts.SmallPackSize, "repack-smaller-than", "", "pack `below-limit` packfiles (allowed suffixes: k/K, m/M)")
 }
 
-func runPrune(gopts GlobalOptions) error {
-	repo, err := OpenRepository(gopts)
-	if err != nil {
-		return err
-	}
-
-	lock, err := lockRepoExclusive(repo)
-	defer unlockRepo(lock)
-	if err != nil {
-		return err
-	}
-
-	return pruneRepository(gopts, repo)
-}
-
-func mixedBlobs(list []restic.Blob) bool {
-	var tree, data bool
-
-	for _, pb := range list {
-		switch pb.Type {
-		case restic.TreeBlob:
-			tree = true
-		case restic.DataBlob:
-			data = true
-		}
-
-		if tree && data {
-			return true
-		}
-	}
-
-	return false
-}
-
-func pruneRepository(gopts GlobalOptions, repo restic.Repository) error {
-	ctx := gopts.ctx
-
-	err := repo.LoadIndex(ctx)
-	if err != nil {
-		return err
-	}
-
-	var stats struct {
-		blobs     int
-		packs     int
-		snapshots int
-		bytes     int64
-	}
-
-	Verbosef("counting files in repo\n")
-	err = repo.List(ctx, restic.DataFile, func(restic.ID, int64) error {
-		stats.packs++
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-
-	Verbosef("building new index for repo\n")
-
-	bar := newProgressMax(!gopts.Quiet, uint64(stats.packs), "packs")
-	idx, invalidFiles, err := index.New(ctx, repo, restic.NewIDSet(), bar)
-	if err != nil {
-		return err
-	}
-
-	for _, id := range invalidFiles {
-		Warnf("incomplete pack file (will be removed): %v\n", id)
-	}
-
-	blobs := 0
-	for _, pack := range idx.Packs {
-		stats.bytes += pack.Size
-		blobs += len(pack.Entries)
-	}
-	Verbosef("repository contains %v packs (%v blobs) with %v\n",
-		len(idx.Packs), blobs, formatBytes(uint64(stats.bytes)))
-
-	blobCount := make(map[restic.BlobHandle]int)
-	var duplicateBlobs uint64
-	var duplicateBytes uint64
-
-	// find duplicate blobs
-	for _, p := range idx.Packs {
-		for _, entry := range p.Entries {
-			stats.blobs++
-			h := restic.BlobHandle{ID: entry.ID, Type: entry.Type}
-			blobCount[h]++
-
-			if blobCount[h] > 1 {
-				duplicateBlobs++
-				duplicateBytes += uint64(entry.Length)
-			}
-		}
-	}
-
-	Verbosef("processed %d blobs: %d duplicate blobs, %v duplicate\n",
-		stats.blobs, duplicateBlobs, formatBytes(uint64(duplicateBytes)))
-	Verbosef("load all snapshots\n")
-
-	// find referenced blobs
-	snapshots, err := restic.LoadAllSnapshots(ctx, repo)
-	if err != nil {
-		return err
-	}
-
-	stats.snapshots = len(snapshots)
-
-	Verbosef("find data that is still in use for %d snapshots\n", stats.snapshots)
-
-	usedBlobs := restic.NewBlobSet()
-	seenBlobs := restic.NewBlobSet()
-
-	bar = newProgressMax(!gopts.Quiet, uint64(len(snapshots)), "snapshots")
-	bar.Start()
-	for _, sn := range snapshots {
-		debug.Log("process snapshot %v", sn.ID())
-
-		err = restic.FindUsedBlobs(ctx, repo, *sn.Tree, usedBlobs, seenBlobs)
-		if err != nil {
-			if repo.Backend().IsNotExist(err) {
-				return errors.Fatal("unable to load a tree from the repo: " + err.Error())
-			}
-
-			return err
-		}
-
-		debug.Log("processed snapshot %v", sn.ID())
-		bar.Report(restic.Stat{Blobs: 1})
-	}
-	bar.Done()
-
-	if len(usedBlobs) > stats.blobs {
-		return errors.Fatalf("number of used blobs is larger than number of available blobs!\n" +
-			"Please report this error (along with the output of the 'prune' run) at\n" +
-			"https://github.com/restic/restic/issues/new")
-	}
-
-	Verbosef("found %d of %d data blobs still in use, removing %d blobs\n",
-		len(usedBlobs), stats.blobs, stats.blobs-len(usedBlobs))
-
-	// find packs that need a rewrite
-	rewritePacks := restic.NewIDSet()
-	for _, pack := range idx.Packs {
-		if mixedBlobs(pack.Entries) {
-			rewritePacks.Insert(pack.ID)
-			continue
-		}
-
-		for _, blob := range pack.Entries {
-			h := restic.BlobHandle{ID: blob.ID, Type: blob.Type}
-			if !usedBlobs.Has(h) {
-				rewritePacks.Insert(pack.ID)
-				continue
-			}
-
-			if blobCount[h] > 1 {
-				rewritePacks.Insert(pack.ID)
-			}
-		}
-	}
-
-	removeBytes := duplicateBytes
-
-	// find packs that are unneeded
-	removePacks := restic.NewIDSet()
-
-	Verbosef("will remove %d invalid files\n", len(invalidFiles))
-	for _, id := range invalidFiles {
-		removePacks.Insert(id)
-	}
-
-	for packID, p := range idx.Packs {
-
-		hasActiveBlob := false
-		for _, blob := range p.Entries {
-			h := restic.BlobHandle{ID: blob.ID, Type: blob.Type}
-			if usedBlobs.Has(h) {
-				hasActiveBlob = true
-				continue
-			}
-
-			removeBytes += uint64(blob.Length)
-		}
-
-		if hasActiveBlob {
-			continue
-		}
-
-		removePacks.Insert(packID)
-
-		if !rewritePacks.Has(packID) {
-			return errors.Fatalf("pack %v is unneeded, but not contained in rewritePacks", packID.Str())
-		}
-
-		rewritePacks.Delete(packID)
-	}
-
-	Verbosef("will delete %d packs and rewrite %d packs, this frees %s\n",
-		len(removePacks), len(rewritePacks), formatBytes(uint64(removeBytes)))
-
-	var obsoletePacks restic.IDSet
-	if len(rewritePacks) != 0 {
-		bar = newProgressMax(!gopts.Quiet, uint64(len(rewritePacks)), "packs rewritten")
-		bar.Start()
-		obsoletePacks, err = repository.Repack(ctx, repo, rewritePacks, usedBlobs, bar)
+func verifyPruneOptions(opts *PruneOptions) error {
+	opts.MaxRepackBytes = math.MaxUint64
+	if len(opts.MaxRepackSize) > 0 {
+		size, err := ui.ParseBytes(opts.MaxRepackSize)
 		if err != nil {
 			return err
 		}
-		bar.Done()
+		opts.MaxRepackBytes = uint64(size)
+	}
+	if opts.UnsafeNoSpaceRecovery != "" {
+		// prevent repacking data to make sure users cannot get stuck.
+		opts.MaxRepackBytes = 0
 	}
 
-	removePacks.Merge(obsoletePacks)
+	maxUnused := strings.TrimSpace(opts.MaxUnused)
+	if maxUnused == "" {
+		return errors.Fatalf("invalid value for --max-unused: %q", opts.MaxUnused)
+	}
 
-	if err = rebuildIndex(ctx, repo, removePacks); err != nil {
+	// parse MaxUnused either as unlimited, a percentage, or an absolute number of bytes
+	switch {
+	case maxUnused == "unlimited":
+		opts.maxUnusedBytes = func(_ uint64) uint64 {
+			return math.MaxUint64
+		}
+
+	case strings.HasSuffix(maxUnused, "%"):
+		maxUnused = strings.TrimSuffix(maxUnused, "%")
+		p, err := strconv.ParseFloat(maxUnused, 64)
+		if err != nil {
+			return errors.Fatalf("invalid percentage %q passed for --max-unused: %v", opts.MaxUnused, err)
+		}
+
+		if p < 0 {
+			return errors.Fatal("percentage for --max-unused must be positive")
+		}
+
+		if p >= 100 {
+			return errors.Fatal("percentage for --max-unused must be below 100%")
+		}
+
+		opts.maxUnusedBytes = func(used uint64) uint64 {
+			return uint64(p / (100 - p) * float64(used))
+		}
+
+	default:
+		size, err := ui.ParseBytes(maxUnused)
+		if err != nil {
+			return errors.Fatalf("invalid number of bytes %q for --max-unused: %v", opts.MaxUnused, err)
+		}
+
+		opts.maxUnusedBytes = func(_ uint64) uint64 {
+			return uint64(size)
+		}
+	}
+
+	if opts.SmallPackSize != "" {
+		size, err := ui.ParseBytes(opts.SmallPackSize)
+		if err != nil {
+			return errors.Fatalf("invalid number of bytes %q for --repack-smaller-than: %v", opts.SmallPackSize, err)
+		}
+		opts.SmallPackBytes = uint64(size)
+		opts.RepackSmall = true
+	}
+
+	return nil
+}
+
+func runPrune(ctx context.Context, opts PruneOptions, gopts global.Options, term ui.Terminal) error {
+	err := verifyPruneOptions(&opts)
+	if err != nil {
 		return err
 	}
 
-	if len(removePacks) != 0 {
-		bar = newProgressMax(!gopts.Quiet, uint64(len(removePacks)), "packs deleted")
-		bar.Start()
-		for packID := range removePacks {
-			h := restic.Handle{Type: restic.DataFile, Name: packID.String()}
-			err = repo.Backend().Remove(ctx, h)
+	if opts.RepackUncompressed && gopts.Compression == repository.CompressionOff {
+		return errors.Fatal("disabled compression and `--repack-uncompressed` are mutually exclusive")
+	}
+
+	if gopts.NoLock && !opts.DryRun {
+		return errors.Fatal("--no-lock is only applicable in combination with --dry-run for prune command")
+	}
+
+	printer := ui.NewProgressPrinter(false, gopts.Verbosity, term)
+	ctx, repo, unlock, err := openWithExclusiveLock(ctx, gopts, opts.DryRun && gopts.NoLock, printer)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	if opts.UnsafeNoSpaceRecovery != "" {
+		repoID := repo.Config().ID
+		if opts.UnsafeNoSpaceRecovery != repoID {
+			return errors.Fatalf("must pass id '%s' to --unsafe-recover-no-free-space", repoID)
+		}
+		opts.unsafeRecovery = true
+	}
+
+	return runPruneWithRepo(ctx, opts, repo, restic.NewIDSet(), printer)
+}
+
+func runPruneWithRepo(ctx context.Context, opts PruneOptions, repo *repository.Repository, ignoreSnapshots restic.IDSet, printer progress.Printer) error {
+	if repo.Cache() == nil {
+		printer.S("warning: running prune without a cache, this may be very slow!")
+	}
+
+	// loading the index before the snapshots is ok, as we use an exclusive lock here
+	err := repo.LoadIndex(ctx, printer)
+	if err != nil {
+		return err
+	}
+
+	popts := repository.PruneOptions{
+		DryRun:         opts.DryRun,
+		UnsafeRecovery: opts.unsafeRecovery,
+
+		MaxUnusedBytes: opts.maxUnusedBytes,
+		MaxRepackBytes: opts.MaxRepackBytes,
+		SmallPackBytes: opts.SmallPackBytes,
+
+		RepackCacheableOnly: opts.RepackCacheableOnly,
+		RepackSmall:         opts.RepackSmall,
+		RepackUncompressed:  opts.RepackUncompressed,
+	}
+
+	plan, err := repository.PlanPrune(ctx, popts, repo, func(ctx context.Context, repo restic.Repository, usedBlobs restic.FindBlobSet) error {
+		return getUsedBlobs(ctx, repo, usedBlobs, ignoreSnapshots, printer)
+	}, printer)
+	if err != nil {
+		return err
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	if popts.DryRun {
+		printer.P("\nWould have made the following changes:")
+	}
+
+	err = printPruneStats(printer, plan.Stats())
+	if err != nil {
+		return err
+	}
+
+	// Trigger GC to reset garbage collection threshold
+	runtime.GC()
+
+	return plan.Execute(ctx, printer)
+}
+
+// printPruneStats prints out the statistics
+func printPruneStats(printer progress.Printer, stats repository.PruneStats) error {
+	printer.V("\nused:         %10d blobs / %s\n", stats.Blobs.Used, ui.FormatBytes(stats.Size.Used))
+	if stats.Blobs.Duplicate > 0 {
+		printer.V("duplicates:   %10d blobs / %s\n", stats.Blobs.Duplicate, ui.FormatBytes(stats.Size.Duplicate))
+	}
+	printer.V("unused:       %10d blobs / %s\n", stats.Blobs.Unused, ui.FormatBytes(stats.Size.Unused))
+	if stats.Size.Unref > 0 {
+		printer.V("unreferenced:                    %s\n", ui.FormatBytes(stats.Size.Unref))
+	}
+	totalBlobs := stats.Blobs.Used + stats.Blobs.Unused + stats.Blobs.Duplicate
+	totalSize := stats.Size.Used + stats.Size.Duplicate + stats.Size.Unused + stats.Size.Unref
+	unusedSize := stats.Size.Duplicate + stats.Size.Unused
+	printer.V("total:        %10d blobs / %s\n", totalBlobs, ui.FormatBytes(totalSize))
+	printer.V("unused size: %s of total size\n", ui.FormatPercent(unusedSize, totalSize))
+
+	printer.P("\nto repack:    %10d blobs / %s\n", stats.Blobs.Repack, ui.FormatBytes(stats.Size.Repack))
+	printer.P("this removes: %10d blobs / %s\n", stats.Blobs.Repackrm, ui.FormatBytes(stats.Size.Repackrm))
+	printer.P("to delete:    %10d blobs / %s\n", stats.Blobs.Remove, ui.FormatBytes(stats.Size.Remove+stats.Size.Unref))
+	totalPruneSize := stats.Size.Remove + stats.Size.Repackrm + stats.Size.Unref
+	printer.P("total prune:  %10d blobs / %s\n", stats.Blobs.Remove+stats.Blobs.Repackrm, ui.FormatBytes(totalPruneSize))
+	if stats.Size.Uncompressed > 0 {
+		printer.P("not yet compressed:              %s\n", ui.FormatBytes(stats.Size.Uncompressed))
+	}
+	printer.P("remaining:    %10d blobs / %s\n", totalBlobs-(stats.Blobs.Remove+stats.Blobs.Repackrm), ui.FormatBytes(totalSize-totalPruneSize))
+	unusedAfter := unusedSize - stats.Size.Remove - stats.Size.Repackrm
+	printer.P("unused size after prune: %s (%s of remaining size)\n",
+		ui.FormatBytes(unusedAfter), ui.FormatPercent(unusedAfter, totalSize-totalPruneSize))
+	printer.P("\n")
+	printer.V("totally used packs: %10d\n", stats.Packs.Used)
+	printer.V("partly used packs:  %10d\n", stats.Packs.PartlyUsed)
+	printer.V("unused packs:       %10d\n\n", stats.Packs.Unused)
+
+	printer.V("to keep:      %10d packs\n", stats.Packs.Keep)
+	printer.V("to repack:    %10d packs\n", stats.Packs.Repack)
+	printer.V("to delete:    %10d packs\n", stats.Packs.Remove)
+	if stats.Packs.Unref > 0 {
+		printer.V("to delete:    %10d unreferenced packs\n\n", stats.Packs.Unref)
+	}
+	return nil
+}
+
+func getUsedBlobs(ctx context.Context, repo restic.Repository, usedBlobs restic.FindBlobSet, ignoreSnapshots restic.IDSet, printer progress.Printer) error {
+	var snapshotTrees restic.IDs
+	printer.P("loading all snapshots...\n")
+	err := data.ForAllSnapshots(ctx, repo, repo, ignoreSnapshots,
+		func(id restic.ID, sn *data.Snapshot, err error) error {
 			if err != nil {
-				Warnf("unable to remove file %v from the repository\n", packID.Str())
+				debug.Log("failed to load snapshot %v (error %v)", id, err)
+				return err
 			}
-			bar.Report(restic.Stat{Blobs: 1})
-		}
-		bar.Done()
+			debug.Log("add snapshot %v (tree %v)", id, *sn.Tree)
+			snapshotTrees = append(snapshotTrees, *sn.Tree)
+			return nil
+		})
+	if err != nil {
+		return errors.Fatalf("failed loading snapshot: %v", err)
 	}
 
-	Verbosef("done\n")
+	printer.P("finding data that is still in use for %d snapshots\n", len(snapshotTrees))
+
+	bar := printer.NewCounter("snapshots")
+	bar.SetMax(uint64(len(snapshotTrees)))
+	defer bar.Done()
+
+	err = data.FindUsedBlobs(ctx, repo, snapshotTrees, usedBlobs, bar)
+	if err != nil {
+		return errors.Fatalf("failed finding blobs: %v", err)
+	}
+
 	return nil
 }

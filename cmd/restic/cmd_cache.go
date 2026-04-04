@@ -5,30 +5,42 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
-	"github.com/restic/restic/internal/cache"
+	"github.com/restic/restic/internal/backend/cache"
 	"github.com/restic/restic/internal/errors"
-	"github.com/restic/restic/internal/fs"
+	"github.com/restic/restic/internal/global"
+	"github.com/restic/restic/internal/ui"
 	"github.com/restic/restic/internal/ui/table"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
-var cmdCache = &cobra.Command{
-	Use:   "cache",
-	Short: "Operate on local cache directories",
-	Long: `
+func newCacheCommand(globalOptions *global.Options) *cobra.Command {
+	var opts CacheOptions
+
+	cmd := &cobra.Command{
+		Use:   "cache",
+		Short: "Operate on local cache directories",
+		Long: `
 The "cache" command allows listing and cleaning local cache directories.
 
 EXIT STATUS
 ===========
 
-Exit status is 0 if the command was successful, and non-zero if there was any error.
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
 `,
-	DisableAutoGenTag: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runCache(cacheOptions, globalOptions, args)
-	},
+		GroupID:           cmdGroupDefault,
+		DisableAutoGenTag: true,
+		RunE: func(_ *cobra.Command, args []string) error {
+			return runCache(opts, *globalOptions, args, globalOptions.Term)
+		},
+	}
+
+	opts.AddFlags(cmd.Flags())
+	return cmd
 }
 
 // CacheOptions bundles all options for the snapshots command.
@@ -38,20 +50,17 @@ type CacheOptions struct {
 	NoSize  bool
 }
 
-var cacheOptions CacheOptions
-
-func init() {
-	cmdRoot.AddCommand(cmdCache)
-
-	f := cmdCache.Flags()
-	f.BoolVar(&cacheOptions.Cleanup, "cleanup", false, "remove old cache directories")
-	f.UintVar(&cacheOptions.MaxAge, "max-age", 30, "max age in `days` for cache directories to be considered old")
-	f.BoolVar(&cacheOptions.NoSize, "no-size", false, "do not output the size of the cache directories")
+func (opts *CacheOptions) AddFlags(f *pflag.FlagSet) {
+	f.BoolVar(&opts.Cleanup, "cleanup", false, "remove old cache directories")
+	f.UintVar(&opts.MaxAge, "max-age", 30, "max age in `days` for cache directories to be considered old")
+	f.BoolVar(&opts.NoSize, "no-size", false, "do not output the size of the cache directories")
 }
 
-func runCache(opts CacheOptions, gopts GlobalOptions, args []string) error {
+func runCache(opts CacheOptions, gopts global.Options, args []string, term ui.Terminal) error {
+	printer := ui.NewProgressPrinter(false, gopts.Verbosity, term)
+
 	if len(args) > 0 {
-		return errors.Fatal("the cache command has no arguments")
+		return errors.Fatal("the cache command expects no arguments, only options - please see `restic help cache` for usage and flags")
 	}
 
 	if gopts.NoCache {
@@ -77,17 +86,17 @@ func runCache(opts CacheOptions, gopts GlobalOptions, args []string) error {
 		}
 
 		if len(oldDirs) == 0 {
-			Verbosef("no old cache dirs found\n")
+			printer.P("no old cache dirs found")
 			return nil
 		}
 
-		Verbosef("remove %d old cache directories\n", len(oldDirs))
+		printer.P("remove %d old cache directories", len(oldDirs))
 
 		for _, item := range oldDirs {
 			dir := filepath.Join(cachedir, item.Name())
-			err = fs.RemoveAll(dir)
+			err = os.RemoveAll(dir)
 			if err != nil {
-				Warnf("unable to remove %v: %v\n", dir, err)
+				printer.E("unable to remove %v: %v", dir, err)
 			}
 		}
 
@@ -117,7 +126,7 @@ func runCache(opts CacheOptions, gopts GlobalOptions, args []string) error {
 	}
 
 	if len(dirs) == 0 {
-		Printf("no cache dirs found, basedir is %v\n", cachedir)
+		printer.S("no cache dirs found, basedir is %v", cachedir)
 		return nil
 	}
 
@@ -137,19 +146,24 @@ func runCache(opts CacheOptions, gopts GlobalOptions, args []string) error {
 			if err != nil {
 				return err
 			}
-			size = fmt.Sprintf("%11s", formatBytes(uint64(bytes)))
+			size = fmt.Sprintf("%11s", ui.FormatBytes(uint64(bytes)))
+		}
+
+		name := entry.Name()
+		if !strings.HasPrefix(name, "restic-check-cache-") {
+			name = name[:10]
 		}
 
 		tab.AddRow(data{
-			entry.Name()[:10],
+			name,
 			fmt.Sprintf("%d days ago", uint(time.Since(entry.ModTime()).Hours()/24)),
 			old,
 			size,
 		})
 	}
 
-	tab.Write(gopts.stdout)
-	Printf("%d cache dirs in %s\n", len(dirs), cachedir)
+	_ = tab.Write(gopts.Term.OutputWriter())
+	printer.S("%d cache dirs in %s", len(dirs), cachedir)
 
 	return nil
 }

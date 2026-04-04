@@ -3,6 +3,32 @@ FAQ
 
 This is the list of Frequently Asked Questions for restic.
 
+Will restic resume an interrupted backup?
+-----------------------------------------
+
+Yes, restic will resume interrupted backups when they are re-run.
+
+When backing up, restic periodically writes index files to keep a record of
+the uploaded data. Even if there's no snapshot created in the end (due to the
+backup being interrupted), these indexes are stored in the repository for the
+data that has been uploaded so far. Next time restic runs, it is then able to
+find the uploaded data through these indexes, and thereby reference it again
+without having to upload it a second time. This effectively makes it continue
+from where it saved the last index, which should be up to a few minutes ago.
+
+It does not matter if the backup was interrupted by the user or if it was due
+to unforeseen circumstances such as connectivity issues, power loss, etc.
+Simply re-run the backup again and restic should only upload what it needs to
+in order to complete the interrupted backup and create a snapshot.
+
+Note however that during the initial backup run and any re-tries, until there
+has been a first snapshot created for the backup set (list of files and
+directories to be backed up), restic will need to re-scan the files on disk as
+there is no parent snapshot to compare the filesystem with to determine which
+files have changed. This process should however be far quicker than the
+uploading, and it's normal to see restic scan the files again when re-running
+the backup.
+
 ``restic check`` reports packs that aren't referenced in any index, is my repository broken?
 --------------------------------------------------------------------------------------------
 
@@ -14,18 +40,21 @@ looks like this:
 ::
 
     $ restic check
-    Create exclusive lock for repository
-    Load indexes
-    Check all packs
+    create exclusive lock for repository
+    load indexes
+    check all packs
     pack 819a9a52e4f51230afa89aefbf90df37fb70996337ae57e6f7a822959206a85e: not referenced in any index
     pack de299e69fb075354a3775b6b045d152387201f1cdc229c31d1caa34c3b340141: not referenced in any index
-    Check snapshots, trees and blobs
-    Fatal: repository contains errors
+    2 additional files were found in the repo, which likely contain duplicate data.
+    You can run `restic prune` to correct this.
+    check snapshots, trees and blobs
+    [0:00] 100.00%  16 / 16 snapshots
+    no errors were found
 
-The message means that there is more data stored in the repo than
-strictly necessary. With high probability this is duplicate data. In
-order to clean it up, the command ``restic prune`` can be used. The
-cause of this bug is not yet known.
+The message means that there is more data stored in the repository than
+strictly necessary. This is uncritical. With high probability this is duplicate data
+caused by an interrupted backup run or upload operation. In
+order to clean it up, the command ``restic prune`` can be used.
 
 I ran a ``restic`` command but it is not working as intended, what do I do now?
 -------------------------------------------------------------------------------
@@ -61,7 +90,7 @@ The error here is that the tilde ``~`` in ``"~/documents"`` didn't get expanded 
     /home/john/documents
 
     $ echo "~/documents"
-    ~/document
+    ~/documents
 
     $ echo "$HOME/documents"
     /home/john/documents
@@ -71,7 +100,7 @@ Restic handles globbing and expansion in the following ways:
 -  Globbing is only expanded for lines read via ``--files-from``
 -  Environment variables are not expanded in the file read via ``--files-from``
 -  ``*`` is expanded for paths read via ``--files-from``
--  e.g. For backup targets given to restic as arguments on the shell, neither glob expansion nor shell variable replacement is done. If restic is called as ``restic backup '*' '$HOME'``, it will try to backup the literal file(s)/dir(s) ``*`` and ``$HOME``
+-  e.g. For backup sources given to restic as arguments on the shell, neither glob expansion nor shell variable replacement is done. If restic is called as ``restic backup '*' '$HOME'``, it will try to backup the literal file(s)/dir(s) ``*`` and ``$HOME``
 -  Double-asterisk ``**`` only works in exclude patterns as this is a custom extension built into restic; the shell must not expand it
 
 
@@ -81,9 +110,8 @@ How can I specify encryption passwords automatically?
 When you run ``restic backup``, you need to enter the passphrase on
 the console. This is not very convenient for automated backups, so you
 can also provide the password through the ``--password-file`` option, or one of
-the environment variables ``RESTIC_PASSWORD`` or ``RESTIC_PASSWORD_FILE``.
-A discussion is in progress over implementing unattended backups happens in
-:issue:`533`.
+the environment variables: ``RESTIC_PASSWORD``, ``RESTIC_PASSWORD_FILE``,
+or ``RESTIC_PASSWORD_COMMAND``.
 
 .. important:: Be careful how you set the environment; using the env
                command, a `system()` call or using inline shell
@@ -95,9 +123,32 @@ A discussion is in progress over implementing unattended backups happens in
                `accessible only to that user`_. Please make sure that
                the permissions on the files where the password is
                eventually stored are safe (e.g. `0600` and owned by
-               root).
+               root). Note also that ``RESTIC_PASSWORD_COMMAND`` is
+               safe because it does not export the password itself to
+               the environment.
 
 .. _accessible only to that user: https://security.stackexchange.com/questions/14000/environment-variable-accessibility-in-linux/14009#14009
+
+On platforms with an available keychain, keyring or similar secret store, a
+user can add and then dynamically retrieve passwords, cloud credentials,
+repository paths, or any other data deemed sensitive. Here's an example of
+part of a shell script using the `built-in`_ ``security`` command on macOS
+to retrieve credentials from the system's Keychain before running various
+``restic`` commands:
+
+.. _built-in: https://ss64.com/mac/security.html
+
+::
+
+    export GOOGLE_PROJECT_ID=$(security find-generic-password -a resticGCS -s restic_project_ID -w)
+
+    export GOOGLE_APPLICATION_CREDENTIALS=$(security find-generic-password -a resticGCS -s restic_key -w)
+
+    export RESTIC_REPOSITORY=$(security find-generic-password -a resticGCS -s restic_repo_path -w)
+
+    export RESTIC_PASSWORD_COMMAND='security find-generic-password -a resticGCS -s restic_pwd -w' 
+
+
 
 How to prioritize restic's IO and CPU time
 ------------------------------------------
@@ -139,8 +190,8 @@ scheduling algorithm to give it the least favorable niceness (19).
 The above example makes sure that the system the backup runs on
 is not slowed down, which is particularly useful for servers.
 
-Creating new repo on a Synology NAS via sftp fails
---------------------------------------------------
+Creating new repository on a Synology NAS via sftp fails
+--------------------------------------------------------
 
 For using restic with a Synology NAS via sftp, please make sure that the
 specified path is absolute, it must start with a slash (``/``).
@@ -150,7 +201,7 @@ with an error similar to the following:
 
 ::
 
-    $ restic init -r sftp:user@nas:/volume1/restic-repo init
+    $ restic -r sftp:user@nas:/volume1/restic-repo init
     create backend at sftp:user@nas:/volume1/restic-repo/ failed:
         mkdirAll(/volume1/restic-repo/index): unable to create directories: [...]
 
@@ -170,7 +221,7 @@ The following may work:
 
 ::
 
-    $ restic init -r sftp:user@nas:/restic-repo init
+    $ restic -r sftp:user@nas:/restic-repo init
 
 Why does restic perform so poorly on Windows?
 ---------------------------------------------
@@ -181,3 +232,65 @@ temporarily disable your antivirus software to find out if it is the cause for
 your performance problems. If you are certain that the antivirus software is
 the cause for this and you want to gain maximum performance, you have to add
 the restic binary to an exclusions list within the antivirus software.
+
+How do I choose a strong password?
+----------------------------------
+
+Length is the single most important component in password strength.  That doesn't
+mean that other components such as complexity and entropy (or randomness) are not
+important to consider.  A strong password includes Alphabetical, Numerical and
+Special characters. For example, ``nk3E9Rr26md6GGySyyWMrfakw8Jck4$&vVY6`` would
+be a very strong password, if not for being in this documentation.
+
+There are plenty of tools out there, such as OpenSSL, pwgen or KeePass that can
+generate a sufficiently complex, random and long password.
+
+Restic backup command fails to find a valid file in Windows
+-----------------------------------------------------------
+
+If the name of a file in Windows contains an invalid character, Restic will not be
+able to read the file. To solve this issue, consider renaming the particular file.
+
+What can I do in case of "request timeout" errors?
+--------------------------------------------------
+
+Restic monitors connections to the backend to detect stuck requests. If a request
+does not return any data within five minutes, restic assumes the request is stuck and
+retries it. However, for large repositories it sometimes takes longer than that to
+collect a list of all files, causing the following error:
+
+::
+
+    List(data) returned error, retrying after 1s: [...]: request timeout
+
+In this case you can increase the timeout using the ``--stuck-request-timeout`` option.
+
+Are "cold storages" supported?
+------------------------------
+
+Generally, restic does not natively support "cold storage" solutions. However,
+experimental support for restoring from **S3 Glacier** and **S3 Glacier Deep
+Archive** storage classes is available:
+
+.. code-block:: console
+
+   $ restic backup -o s3.storage-class=GLACIER somedir/
+   $ RESTIC_FEATURES=s3-restore restic restore -o s3.enable-restore=1 -o s3.restore-days=7 -o s3.restore-timeout=24h latest
+
+**Notes:**
+
+- This feature is still in early alpha stage. Expect arbitrary breaking changes
+  in the future (although we'll do our best-effort to avoid them).
+- Expect restores to hang from 1 up to 42 hours depending on your storage
+  class, provider and luck. Restores from cold storages are known to be
+  time-consuming. You may need to adjust the `s3.restore-timeout` if a restore
+  operation takes more than 24 hours.
+- Restic will prevent sending metadata files (such as config files, lock files
+  or tree blobs) to Glacier or Deep Archive. Standard class is used instead to
+  ensure normal and fast operations for most tasks.
+- Currently, only the following commands are known to work:
+
+  - `backup`
+  - `copy`
+  - `prune`
+  - `restore`

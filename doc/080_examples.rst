@@ -21,7 +21,7 @@ Setting up restic with Amazon S3
 Preface
 =======
 
-This tutorial will show you how to use restic with AWS S3. It will show you how
+This tutorial will show you how to use restic with Amazon S3. It will show you how
 to navigate the AWS web interface, create an S3 bucket, create a user with
 access to only this bucket, and finally how to connect restic to this bucket.
 
@@ -202,11 +202,12 @@ configuration of restic will be placed into environment variables. This will
 include sensitive information, such as your AWS secret and repository password.
 Therefore, make sure the next commands **do not** end up in your shell's
 history file. Adjust the contents of the environment variables to fit your
-bucket's name and your user's API credentials.
+bucket's name, region, and your user's API credentials.
 
 .. code-block:: console
 
    $ unset HISTFILE
+   $ export AWS_DEFAULT_REGION="eu-west-1"
    $ export RESTIC_REPOSITORY="s3:https://s3.amazonaws.com/restic-demo"
    $ export AWS_ACCESS_KEY_ID="AKIAJAJSLTZCAZ4SRI5Q"
    $ export AWS_SECRET_ACCESS_KEY="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"
@@ -219,14 +220,14 @@ repository:
 
 .. code-block:: console
 
-   $ ./restic init
+   $ restic init
    created restic backend b5c661a86a at s3:https://s3.amazonaws.com/restic-demo
 
    Please note that knowledge of your password is required to access
    the repository. Losing your password means that your data is
    irrecoverably lost.
 
-restic is now ready to be used with AWS S3. Try to create a backup:
+restic is now ready to be used with Amazon S3. Try to create a backup:
 
 .. code-block:: console
 
@@ -235,23 +236,23 @@ restic is now ready to be used with AWS S3. Try to create a backup:
    10+0 records out
    10485760 bytes (10 MB, 10 MiB) copied, 0,0891322 s, 118 MB/s
 
-   $ ./restic backup test.bin
+   $ restic backup test.bin
    scan [/home/philip/restic-demo/test.bin]
    scanned 0 directories, 1 files in 0:00
    [0:04] 100.00%  2.500 MiB/s  10.000 MiB / 10.000 MiB  1 / 1 items ... ETA 0:00 
    duration: 0:04, 2.47MiB/s
    snapshot 10fdbace saved
 
-   $ ./restic snapshots
+   $ restic snapshots
    ID        Date                 Host        Tags        Directory
    ----------------------------------------------------------------------
    10fdbace  2017-03-26 16:41:50  blackbox                /home/philip/restic-demo/test.bin
 
-A snapshot was created and stored in the S3 bucket. By default backups to AWS S3 will use the ``STANDARD`` storage class. Available storage classes include ``STANDARD``, ``STANDARD_IA``, ``ONEZONE_IA``, ``INTELLIGENT_TIERING``, and ``REDUCED_REDUNDANCY``. A different storage class could have been specified in the above command by using ``-o`` or ``--option``:
+A snapshot was created and stored in the S3 bucket. By default backups to Amazon S3 will use the ``STANDARD`` storage class. Available storage classes include ``STANDARD``, ``STANDARD_IA``, ``ONEZONE_IA``, ``INTELLIGENT_TIERING``, and ``REDUCED_REDUNDANCY``. A different storage class could have been specified in the above command by using ``-o`` or ``--option``:
 
 .. code-block:: console
 
-  $ ./restic backup -o s3.storage-class=REDUCED_REDUNDANCY test.bin
+  $ restic backup -o s3.storage-class=REDUCED_REDUNDANCY test.bin
 
 This snapshot may now be restored:
 
@@ -259,7 +260,7 @@ This snapshot may now be restored:
 
    $ mkdir restore
 
-   $ ./restic restore 10fdbace --target restore
+   $ restic restore 10fdbace --target restore
    restoring <Snapshot 10fdbace of [/home/philip/restic-demo/test.bin] at 2017-03-26 16:41:50.201418102 +0200 CEST by philip@blackbox> to restore
 
    $ ls restore/
@@ -278,7 +279,7 @@ Motivation
 Creating a complete backup of a machine requires a privileged process
 that is able to read all files. On UNIX-like systems this is
 traditionally the ``root`` user. Processes running as root have
-superpower. They cannot only read all files but do also have the power
+superpower. They can not only read all files but also have the power
 to modify the system in any possible way.
 
 With great power comes great responsibility. If a process running as
@@ -288,47 +289,102 @@ to run programs as root that you trust completely. And even if you
 trust a program, it is good and common practice to run it with the
 least possible privileges.
 
-Capabilities on Linux
-=====================
-
 Fortunately, Linux has functionality to divide root's power into
-single separate *capabilities*. You can remove these from a process
-running as root to restrict it. And you can add capabilities to a
-process running as a normal user, which is what we are going to do.
+single separate *capabilities*. The *CAP_DAC_READ_SEARCH* capability
+allows the current process to "Bypass file read permission checks and
+directory read and execute permission checks", which is what we need to
+back up a system.
 
-Full backup without root
-========================
-
-To be able to completely backup a system, restic has to read all the
-files. Luckily Linux knows a capability that allows precisely this. We
-can assign this single capability to restic and then run it as an
-unprivileged user.
+Using ambient capabilities (recommended)
+========================================
 
 First we create a new user called ``restic`` that is going to create
 the backups:
 
 .. code-block:: console
 
-   root@a3e580b6369d:/# useradd -m restic
+   # useradd --system --create-home --shell /sbin/nologin restic
 
-Then we download and install the restic binary into the user's home
-directory.
+The capability can be granted to a process tree using the
+``setpriv`` command, which must be run as ``root`` user and then
+switches to the ``restic`` user:
 
 .. code-block:: console
 
-   root@a3e580b6369d:/# mkdir ~restic/bin
-   root@a3e580b6369d:/# curl -L https://github.com/restic/restic/releases/download/v0.9.1/restic_0.9.1_linux_amd64.bz2 | bunzip2 > ~restic/bin/restic
+   # setpriv --no-new-privs --reuid=$(id -u restic) --regid=$(id -g restic) --init-groups --reset-env --inh-caps +DAC_READ_SEARCH --ambient-caps +DAC_READ_SEARCH restic backup --exclude={/dev,/media,/mnt,/proc,/run,/sys,/tmp,/var/tmp} /
+
+Using ambient capabilities with systemd
+---------------------------------------
+
+If you are running restic as a systemd service, you can use systemd's
+ambient capability feature to assign the necessary capability without
+modifying the restic binary itself. This is the preferred method,
+as it still works after binary updates.
+
+Add the following directives to the ``[Service]`` section of your
+systemd unit file (e.g., ``/etc/systemd/system/restic.service``):
+
+.. code-block:: ini
+
+   [Service]
+   # ... other directives
+   DynamicUser=yes
+   AmbientCapabilities=CAP_DAC_READ_SEARCH
+   CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+
+Note the use of ``DynamicUser=yes``. This is an added bonus of using the systemd method
+as you do not need to create a ``restic`` user.
+
+After editing the unit file, do not forget to reload systemd's configuration and restart
+the service:
+
+.. code-block:: console
+
+   # systemctl daemon-reload
+
+Using file capabilities
+=======================
+
+.. warning::
+
+   Granting ``CAP_DAC_READ_SEARCH`` to the restic binary allows any process
+   executing that binary to bypass standard file permission checks for reading
+   and directory traversal. In practice, anyone who can execute this binary can
+   read most of the system, regardless of their user ID.
+
+   Ensure that only a dedicated backup user (and root) can execute the
+   capability-enabled restic binary, and treat that account as highly privileged.
+
+   See: `capabilities(7) <https://man7.org/linux/man-pages/man7/capabilities.7.html>`_
+
+Alternatively, the capability can be granted to a file. On every
+execution, the system will read the assigned capabilities and assign
+them to the process. This is less secure than using ambient capabilities
+as anyone who is able to execute the binary can make use of the capability.
+
+First we create a new user called ``restic`` that is going to create
+the backups:
+
+.. code-block:: console
+
+   # useradd --system --create-home --shell /sbin/nologin restic
+
+Then we copy the restic binary into the user's home directory:
+
+.. code-block:: console
+
+   # mkdir /home/restic/bin
+   # cp /usr/bin/restic /home/restic/bin/restic
 
 Before we assign any special capability to the restic binary we
 restrict its permissions so that only root and the newly created
-restic user can execute it. Otherwise another - possibly untrusted -
-user could misuse the privileged restic binary to circumvent file
-access controls.
+restic user can execute it. Otherwise any user could use the
+privileged restic binary to access any file.
 
 .. code-block:: console
 
-   root@a3e580b6369d:/# chown root:restic ~restic/bin/restic
-   root@a3e580b6369d:/# chmod 750 ~restic/bin/restic
+   # chown root:restic /home/restic/bin/restic
+   # chmod 750 /home/restic/bin/restic
 
 Finally we can use ``setcap`` to add an extended attribute to the
 restic binary. On every execution the system will read the extended
@@ -336,12 +392,17 @@ attribute, interpret it and assign capabilities accordingly.
 
 .. code-block:: console
 
-   root@a3e580b6369d:/# setcap cap_dac_read_search=+ep ~restic/bin/restic
+   # setcap cap_dac_read_search=+ep /home/restic/bin/restic
+
+.. important:: The capabilities of the ``setcap`` command only apply to this
+    specific copy of the restic binary. If you run ``restic self-update`` or
+    in any other way replace or update the binary, the capabilities you added
+    will be lost, and you must run the ``setcap`` command again.
 
 From now on the user ``restic`` can run restic to backup the whole
 system.
 
 .. code-block:: console
 
-   root@a3e580b6369d:/# sudo -u restic /home/restic/bin/restic --exclude={/dev,/media,/mnt,/proc,/run,/sys,/tmp,/var/tmp} -r /tmp backup /
+   # runuser -u restic /home/restic/bin/restic -r /tmp backup --exclude={/dev,/media,/mnt,/proc,/run,/sys,/tmp,/var/tmp} /
 

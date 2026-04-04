@@ -1,40 +1,33 @@
-// +build darwin freebsd linux
+//go:build darwin || freebsd || linux
 
 package fuse
 
 import (
 	"os"
-	"time"
 
+	"github.com/restic/restic/internal/bloblru"
+	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/restic"
 
-	"golang.org/x/net/context"
-
-	"bazil.org/fuse/fs"
+	"github.com/anacrolix/fuse/fs"
 )
 
 // Config holds settings for the fuse mount.
 type Config struct {
-	OwnerIsRoot      bool
-	Hosts            []string
-	Tags             []restic.TagList
-	Paths            []string
-	SnapshotTemplate string
+	OwnerIsRoot   bool
+	Filter        data.SnapshotFilter
+	TimeTemplate  string
+	PathTemplates []string
 }
 
 // Root is the root node of the fuse mount of a repository.
 type Root struct {
-	repo          restic.Repository
-	cfg           Config
-	inode         uint64
-	snapshots     restic.Snapshots
-	blobSizeCache *BlobSizeCache
+	repo      restic.Repository
+	cfg       Config
+	blobCache *bloblru.Cache
 
-	snCount   int
-	lastCheck time.Time
-
-	*MetaDir
+	*SnapshotsDir
 
 	uid, gid uint32
 }
@@ -45,15 +38,17 @@ var _ = fs.NodeStringLookuper(&Root{})
 
 const rootInode = 1
 
+// Size of the blob cache. TODO: make this configurable.
+const blobCacheSize = 64 << 20
+
 // NewRoot initializes a new root node from a repository.
-func NewRoot(ctx context.Context, repo restic.Repository, cfg Config) (*Root, error) {
+func NewRoot(repo restic.Repository, cfg Config) *Root {
 	debug.Log("NewRoot(), config %v", cfg)
 
 	root := &Root{
-		repo:          repo,
-		inode:         rootInode,
-		cfg:           cfg,
-		blobSizeCache: NewBlobSizeCache(ctx, repo.Index()),
+		repo:      repo,
+		cfg:       cfg,
+		blobCache: bloblru.New(blobCacheSize),
 	}
 
 	if !cfg.OwnerIsRoot {
@@ -61,16 +56,19 @@ func NewRoot(ctx context.Context, repo restic.Repository, cfg Config) (*Root, er
 		root.gid = uint32(os.Getgid())
 	}
 
-	entries := map[string]fs.Node{
-		"snapshots": NewSnapshotsDir(root, fs.GenerateDynamicInode(root.inode, "snapshots"), "", ""),
-		"tags":      NewTagsDir(root, fs.GenerateDynamicInode(root.inode, "tags")),
-		"hosts":     NewHostsDir(root, fs.GenerateDynamicInode(root.inode, "hosts")),
-		"ids":       NewSnapshotsIDSDir(root, fs.GenerateDynamicInode(root.inode, "ids")),
+	// set defaults, if PathTemplates is not set
+	if len(cfg.PathTemplates) == 0 {
+		cfg.PathTemplates = []string{
+			"ids/%i",
+			"snapshots/%T",
+			"hosts/%h/%T",
+			"tags/%t/%T",
+		}
 	}
 
-	root.MetaDir = NewMetaDir(root, rootInode, entries)
+	root.SnapshotsDir = NewSnapshotsDir(root, func() {}, rootInode, rootInode, NewSnapshotsDirStructure(root, cfg.PathTemplates, cfg.TimeTemplate), "")
 
-	return root, nil
+	return root
 }
 
 // Root is just there to satisfy fs.Root, it returns itself.

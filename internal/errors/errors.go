@@ -1,7 +1,7 @@
 package errors
 
 import (
-	"net/url"
+	stderrors "errors"
 
 	"github.com/pkg/errors"
 )
@@ -22,32 +22,24 @@ var Wrap = errors.Wrap
 // nil, Wrapf returns nil.
 var Wrapf = errors.Wrapf
 
-// WithMessage annotates err with a new message. If err is nil, WithMessage
-// returns nil.
-var WithMessage = errors.WithMessage
+// WithStack annotates err with a stack trace at the point WithStack was called.
+// If err is nil, WithStack returns nil.
+var WithStack = errors.WithStack
 
-// Cause returns the cause of an error. It will also unwrap certain errors,
-// e.g. *url.Error returned by the net/http client.
-func Cause(err error) error {
-	type Causer interface {
-		Cause() error
-	}
+// Go 1.13-style error handling.
 
-	for {
-		// unwrap *url.Error
-		if urlErr, ok := err.(*url.Error); ok {
-			err = urlErr.Err
-			continue
-		}
+// As finds the first error in err's tree that matches target, and if one is found,
+// sets target to that error value and returns true. Otherwise, it returns false.
+func As(err error, tgt interface{}) bool { return stderrors.As(err, tgt) }
 
-		// if err is a Causer, return the cause for this error.
-		if c, ok := err.(Causer); ok {
-			err = c.Cause()
-			continue
-		}
+// Is reports whether any error in err's tree matches target.
+func Is(x, y error) bool { return stderrors.Is(x, y) }
 
-		break
-	}
+func Join(errs ...error) error { return stderrors.Join(errs...) }
 
-	return err
-}
+// Unwrap returns the result of calling the Unwrap method on err, if err's type contains
+// an Unwrap method returning error. Otherwise, Unwrap returns nil.
+//
+// Unwrap only calls a method of the form "Unwrap() error". In particular Unwrap does not
+// unwrap errors returned by [Join].
+func Unwrap(err error) error { return stderrors.Unwrap(err) }

@@ -2,74 +2,77 @@ package main
 
 import (
 	"context"
+	"os"
 
-	"github.com/restic/restic/internal/repository"
+	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/restic"
+	"github.com/restic/restic/internal/ui/progress"
+	"github.com/spf13/pflag"
 )
 
+// initMultiSnapshotFilter is used for commands that work on multiple snapshots
+// MUST be combined with restic.FindFilteredSnapshots or FindFilteredSnapshots
+// MUST be followed by finalizeSnapshotFilter after flag parsing
+func initMultiSnapshotFilter(flags *pflag.FlagSet, filt *data.SnapshotFilter, addHostShorthand bool) {
+	hostShorthand := "H"
+	if !addHostShorthand {
+		hostShorthand = ""
+	}
+	flags.StringArrayVarP(&filt.Hosts, "host", hostShorthand, nil, "only consider snapshots for this `host` (can be specified multiple times, use empty string to unset default value) (default: $RESTIC_HOST)")
+	flags.Var(&filt.Tags, "tag", "only consider snapshots including `tag[,tag,...]` (can be specified multiple times)")
+	flags.StringArrayVar(&filt.Paths, "path", nil, "only consider snapshots including this (absolute) `path` (can be specified multiple times, snapshots must include all specified paths)")
+}
+
+// initSingleSnapshotFilter is used for commands that work on a single snapshot
+// MUST be combined with restic.FindFilteredSnapshot
+// MUST be followed by finalizeSnapshotFilter after flag parsing
+func initSingleSnapshotFilter(flags *pflag.FlagSet, filt *data.SnapshotFilter) {
+	flags.StringArrayVarP(&filt.Hosts, "host", "H", nil, "only consider snapshots for this `host`, when snapshot ID \"latest\" is given (can be specified multiple times, use empty string to unset default value) (default: $RESTIC_HOST)")
+	flags.Var(&filt.Tags, "tag", "only consider snapshots including `tag[,tag,...]`, when snapshot ID \"latest\" is given (can be specified multiple times)")
+	flags.StringArrayVar(&filt.Paths, "path", nil, "only consider snapshots including this (absolute) `path`, when snapshot ID \"latest\" is given (can be specified multiple times, snapshots must include all specified paths)")
+}
+
+// finalizeSnapshotFilter applies RESTIC_HOST default only if --host flag wasn't explicitly set.
+// This allows users to override RESTIC_HOST by providing --host="" or --host with explicit values.
+func finalizeSnapshotFilter(filt *data.SnapshotFilter) {
+	// Only apply RESTIC_HOST default if the --host flag wasn't changed by the user
+	if filt.Hosts == nil {
+		if host := os.Getenv("RESTIC_HOST"); host != "" {
+			filt.Hosts = []string{host}
+		}
+	}
+	// If flag was set to empty string explicitly (e.g., --host=""),
+	// filt.Hosts will be []string{""} which should be cleaned up to allow all hosts
+	if len(filt.Hosts) == 1 && filt.Hosts[0] == "" {
+		filt.Hosts = nil
+	}
+}
+
 // FindFilteredSnapshots yields Snapshots, either given explicitly by `snapshotIDs` or filtered from the list of all snapshots.
-func FindFilteredSnapshots(ctx context.Context, repo *repository.Repository, hosts []string, tags []restic.TagList, paths []string, snapshotIDs []string) <-chan *restic.Snapshot {
-	out := make(chan *restic.Snapshot)
+func FindFilteredSnapshots(ctx context.Context, be restic.Lister, loader restic.LoaderUnpacked, f *data.SnapshotFilter, snapshotIDs []string, printer progress.Printer) <-chan *data.Snapshot {
+	out := make(chan *data.Snapshot)
 	go func() {
 		defer close(out)
-		if len(snapshotIDs) != 0 {
-			var (
-				id         restic.ID
-				usedFilter bool
-				err        error
-			)
-			ids := make(restic.IDs, 0, len(snapshotIDs))
-			// Process all snapshot IDs given as arguments.
-			for _, s := range snapshotIDs {
-				if s == "latest" {
-					id, err = restic.FindLatestSnapshot(ctx, repo, paths, tags, hosts)
-					if err != nil {
-						Warnf("Ignoring %q, no snapshot matched given filter (Paths:%v Tags:%v Hosts:%v)\n", s, paths, tags, hosts)
-						usedFilter = true
-						continue
-					}
-				} else {
-					id, err = restic.FindSnapshot(repo, s)
-					if err != nil {
-						Warnf("Ignoring %q, it is not a snapshot id\n", s)
-						continue
-					}
-				}
-				ids = append(ids, id)
-			}
+		be, err := restic.MemorizeList(ctx, be, restic.SnapshotFile)
+		if err != nil {
+			printer.E("could not load snapshots: %v", err)
+			return
+		}
 
-			// Give the user some indication their filters are not used.
-			if !usedFilter && (len(hosts) != 0 || len(tags) != 0 || len(paths) != 0) {
-				Warnf("Ignoring filters as there are explicit snapshot ids given\n")
-			}
-
-			for _, id := range ids.Uniq() {
-				sn, err := restic.LoadSnapshot(ctx, repo, id)
-				if err != nil {
-					Warnf("Ignoring %q, could not load snapshot: %v\n", id, err)
-					continue
-				}
+		err = f.FindAll(ctx, be, loader, snapshotIDs, func(id string, sn *data.Snapshot, err error) error {
+			if err != nil {
+				printer.E("Ignoring %q: %v", id, err)
+			} else {
 				select {
 				case <-ctx.Done():
-					return
+					return ctx.Err()
 				case out <- sn:
 				}
 			}
-			return
-		}
-
-		snapshots, err := restic.FindFilteredSnapshots(ctx, repo, hosts, tags, paths)
+			return nil
+		})
 		if err != nil {
-			Warnf("could not load snapshots: %v\n", err)
-			return
-		}
-
-		for _, sn := range snapshots {
-			select {
-			case <-ctx.Done():
-				return
-			case out <- sn:
-			}
+			printer.E("could not load snapshots: %v", err)
 		}
 	}()
 	return out

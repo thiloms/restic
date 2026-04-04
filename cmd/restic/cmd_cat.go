@@ -1,74 +1,94 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
-	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
-	"github.com/restic/restic/internal/backend"
+	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/global"
 	"github.com/restic/restic/internal/repository"
 	"github.com/restic/restic/internal/restic"
+	"github.com/restic/restic/internal/ui"
 )
 
-var cmdCat = &cobra.Command{
-	Use:   "cat [flags] [pack|blob|snapshot|index|key|masterkey|config|lock] ID",
-	Short: "Print internal objects to stdout",
-	Long: `
+var catAllowedCmds = []string{"config", "index", "snapshot", "key", "masterkey", "lock", "pack", "blob", "tree"}
+
+func newCatCommand(globalOptions *global.Options) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "cat [flags] [masterkey|config|pack ID|blob ID|snapshot ID|index ID|key ID|lock ID|tree snapshot:subfolder]",
+		Short: "Print internal objects to stdout",
+		Long: `
 The "cat" command is used to print internal objects to stdout.
 
 EXIT STATUS
 ===========
 
-Exit status is 0 if the command was successful, and non-zero if there was any error.
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
+Exit status is 10 if the repository does not exist.
+Exit status is 11 if the repository is already locked.
+Exit status is 12 if the password is incorrect.
 `,
-	DisableAutoGenTag: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runCat(globalOptions, args)
-	},
+		GroupID:           cmdGroupDefault,
+		DisableAutoGenTag: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runCat(cmd.Context(), *globalOptions, args, globalOptions.Term)
+		},
+		ValidArgs: catAllowedCmds,
+	}
+	return cmd
 }
 
-func init() {
-	cmdRoot.AddCommand(cmdCat)
-}
-
-func runCat(gopts GlobalOptions, args []string) error {
-	if len(args) < 1 || (args[0] != "masterkey" && args[0] != "config" && len(args) != 2) {
-		return errors.Fatal("type or ID not specified")
+func validateCatArgs(args []string) error {
+	if len(args) < 1 {
+		return errors.Fatal("type not specified")
 	}
 
-	repo, err := OpenRepository(gopts)
-	if err != nil {
+	validType := false
+	for _, v := range catAllowedCmds {
+		if v == args[0] {
+			validType = true
+			break
+		}
+	}
+	if !validType {
+		return errors.Fatalf("invalid type %q, must be one of [%s]", args[0], strings.Join(catAllowedCmds, "|"))
+	}
+
+	if args[0] != "masterkey" && args[0] != "config" && len(args) != 2 {
+		return errors.Fatal("ID not specified")
+	}
+
+	return nil
+}
+
+func runCat(ctx context.Context, gopts global.Options, args []string, term ui.Terminal) error {
+	printer := ui.NewProgressPrinter(gopts.JSON, gopts.Verbosity, term)
+
+	if err := validateCatArgs(args); err != nil {
 		return err
 	}
 
-	lock, err := lockRepo(repo)
-	defer unlockRepo(lock)
+	ctx, repo, unlock, err := openWithReadLock(ctx, gopts, gopts.NoLock, printer)
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
 	tpe := args[0]
 
 	var id restic.ID
-	if tpe != "masterkey" && tpe != "config" {
+	if tpe != "masterkey" && tpe != "config" && tpe != "snapshot" && tpe != "tree" {
 		id, err = restic.ParseID(args[1])
 		if err != nil {
-			if tpe != "snapshot" {
-				return errors.Fatalf("unable to parse ID: %v\n", err)
-			}
-
-			// find snapshot id with prefix
-			id, err = restic.FindSnapshot(repo, args[1])
-			if err != nil {
-				return errors.Fatalf("could not find snapshot: %v\n", err)
-			}
+			return errors.Fatalf("unable to parse ID: %v", err)
 		}
 	}
 
-	// handle all types that don't need an index
 	switch tpe {
 	case "config":
 		buf, err := json.MarshalIndent(repo.Config(), "", "  ")
@@ -76,51 +96,41 @@ func runCat(gopts GlobalOptions, args []string) error {
 			return err
 		}
 
-		fmt.Println(string(buf))
+		printer.S(string(buf))
 		return nil
 	case "index":
-		buf, err := repo.LoadAndDecrypt(gopts.ctx, nil, restic.IndexFile, id)
+		buf, err := repo.LoadUnpacked(ctx, restic.IndexFile, id)
 		if err != nil {
 			return err
 		}
 
-		_, err = os.Stdout.Write(append(buf, '\n'))
-		return err
-
+		printer.S(string(buf))
+		return nil
 	case "snapshot":
-		sn := &restic.Snapshot{}
-		err = repo.LoadJSONUnpacked(gopts.ctx, restic.SnapshotFile, id, sn)
+		sn, _, err := data.FindSnapshot(ctx, repo, repo, args[1])
+		if err != nil {
+			return errors.Fatalf("could not find snapshot: %v", err)
+		}
+
+		buf, err := json.MarshalIndent(sn, "", "  ")
 		if err != nil {
 			return err
 		}
 
-		buf, err := json.MarshalIndent(&sn, "", "  ")
-		if err != nil {
-			return err
-		}
-
-		fmt.Println(string(buf))
-
+		printer.S(string(buf))
 		return nil
 	case "key":
-		h := restic.Handle{Type: restic.KeyFile, Name: id.String()}
-		buf, err := backend.LoadAll(gopts.ctx, nil, repo.Backend(), h)
+		key, err := repository.LoadKey(ctx, repo, id)
 		if err != nil {
 			return err
 		}
 
-		key := &repository.Key{}
-		err = json.Unmarshal(buf, key)
+		buf, err := json.MarshalIndent(&key, "", "  ")
 		if err != nil {
 			return err
 		}
 
-		buf, err = json.MarshalIndent(&key, "", "  ")
-		if err != nil {
-			return err
-		}
-
-		fmt.Println(string(buf))
+		printer.S(string(buf))
 		return nil
 	case "masterkey":
 		buf, err := json.MarshalIndent(repo.Key(), "", "  ")
@@ -128,10 +138,10 @@ func runCat(gopts GlobalOptions, args []string) error {
 			return err
 		}
 
-		fmt.Println(string(buf))
+		printer.S(string(buf))
 		return nil
 	case "lock":
-		lock, err := restic.LoadLock(gopts.ctx, repo, id)
+		lock, err := restic.LoadLock(ctx, repo, id)
 		if err != nil {
 			return err
 		}
@@ -141,50 +151,68 @@ func runCat(gopts GlobalOptions, args []string) error {
 			return err
 		}
 
-		fmt.Println(string(buf))
-
+		printer.S(string(buf))
 		return nil
-	}
 
-	// load index, handle all the other types
-	err = repo.LoadIndex(gopts.ctx)
-	if err != nil {
-		return err
-	}
-
-	switch tpe {
 	case "pack":
-		h := restic.Handle{Type: restic.DataFile, Name: id.String()}
-		buf, err := backend.LoadAll(gopts.ctx, nil, repo.Backend(), h)
-		if err != nil {
+		buf, err := repo.LoadRaw(ctx, restic.PackFile, id)
+		// allow returning broken pack files
+		if buf == nil {
 			return err
 		}
 
 		hash := restic.Hash(buf)
 		if !hash.Equal(id) {
-			fmt.Fprintf(stderr, "Warning: hash of data does not match ID, want\n  %v\ngot:\n  %v\n", id.String(), hash.String())
+			printer.E("Warning: hash of data does not match ID, want\n  %v\ngot:\n  %v", id.String(), hash.String())
 		}
 
-		_, err = os.Stdout.Write(buf)
+		_, err = term.OutputRaw().Write(buf)
 		return err
 
 	case "blob":
+		err = repo.LoadIndex(ctx, printer)
+		if err != nil {
+			return err
+		}
+
 		for _, t := range []restic.BlobType{restic.DataBlob, restic.TreeBlob} {
-			_, found := repo.Index().Lookup(id, t)
-			if !found {
+			if _, ok := repo.LookupBlobSize(t, id); !ok {
 				continue
 			}
 
-			buf, err := repo.LoadBlob(gopts.ctx, t, id, nil)
+			buf, err := repo.LoadBlob(ctx, t, id, nil)
 			if err != nil {
 				return err
 			}
 
-			_, err = os.Stdout.Write(buf)
+			_, err = term.OutputRaw().Write(buf)
 			return err
 		}
 
 		return errors.Fatal("blob not found")
+
+	case "tree":
+		sn, subfolder, err := data.FindSnapshot(ctx, repo, repo, args[1])
+		if err != nil {
+			return errors.Fatalf("could not find snapshot: %v", err)
+		}
+
+		err = repo.LoadIndex(ctx, printer)
+		if err != nil {
+			return err
+		}
+
+		sn.Tree, err = data.FindTreeDirectory(ctx, repo, sn.Tree, subfolder)
+		if err != nil {
+			return err
+		}
+
+		buf, err := repo.LoadBlob(ctx, restic.TreeBlob, *sn.Tree, nil)
+		if err != nil {
+			return err
+		}
+		_, err = term.OutputRaw().Write(buf)
+		return err
 
 	default:
 		return errors.Fatal("invalid type")
